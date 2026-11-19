@@ -267,3 +267,32 @@ def test_narwhals_frame_group_by_aggregate_nulls(cov: str) -> None:
     assert aggrs[0].cov_ == pytest.approx({("left", "right"): 1.0})
     assert aggrs[1].count_ == 4
     assert aggrs[1].cov_ == pytest.approx({("left", "right"): 20.0})
+
+
+def test_narwhals_frame_filter_complete() -> None:
+    data = pa.table({
+        "a": pa.array([1.0, None, 3.0, 4.0]),
+        "b": pa.array([1.0, 2.0, None, 4.0]),
+    })
+    adapter = tea_tasting.backends.narwhals.NarwhalsFrame(data)
+
+    filtered, total, complete = adapter.filter_complete(("a", "b"))
+
+    assert total == 4
+    assert complete == 2
+    assert filtered.select().equals(data.filter(
+        pc.and_(pc.is_valid(data["a"]), pc.is_valid(data["b"])),
+    ))
+    assert filtered.cov == adapter.cov
+
+
+def test_narwhals_frame_filter_complete_empty_cols() -> None:
+    data = pa.table({
+        "a": pa.array([1.0, None, 3.0, 4.0]),
+    })
+    adapter = tea_tasting.backends.narwhals.NarwhalsFrame(data)
+
+    filtered, total, complete = adapter.filter_complete(())
+
+    assert total == complete == 4
+    assert filtered is adapter

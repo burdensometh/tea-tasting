@@ -379,3 +379,44 @@ def test_read_variants_custom_backend(data_arrow: pa.Table) -> None:
         0,
         1,
     }
+
+
+def test_filter_complete(data_arrow: pa.Table) -> None:
+    table, total, complete = tea_tasting.data.filter_complete(
+        data_arrow,
+        ("sessions", "orders"),
+    )
+    assert total == data_arrow.num_rows
+    assert complete == data_arrow.num_rows
+    assert table.select().equals(data_arrow)
+
+
+def test_filter_complete_with_nulls() -> None:
+    data = pa.table({
+        "a": pa.array([1.0, None, 3.0, 4.0]),
+        "b": pa.array([1.0, 2.0, None, 4.0]),
+    })
+    table, total, complete = tea_tasting.data.filter_complete(data, ("a", "b"))
+    assert total == 4
+    assert complete == 2
+    assert table.select().num_rows == 2
+
+
+def test_filter_complete_empty_cols(data_arrow: pa.Table) -> None:
+    table, total, complete = tea_tasting.data.filter_complete(data_arrow, ())
+    assert total == complete == data_arrow.num_rows
+    assert table.select().equals(data_arrow)
+
+
+def test_filter_complete_custom_backend() -> None:
+    data = pa.table({
+        "a": pa.array([1.0, None, 3.0, 4.0]),
+        "b": pa.array([1.0, 2.0, None, 4.0]),
+    })
+    table, total, complete = tea_tasting.data.filter_complete(
+        FakeTable(data),
+        ("a", "b"),
+    )
+    assert total == 4
+    assert complete == 2
+    assert table.select().num_rows == 2

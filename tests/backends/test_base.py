@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
 import tea_tasting.aggr
 import tea_tasting.backends.base
+
+
+if TYPE_CHECKING:
+    from tea_tasting.backends.base import BaseTableGroupBy
 
 
 def test_get_aggregates_handles_folded_aliases() -> None:
@@ -76,3 +82,73 @@ def test_get_aggregates_converts_null_to_nan() -> None:
     )
 
     assert aggr.mean_["x"] != aggr.mean_["x"]
+
+
+def test_base_table_filter_complete_default() -> None:
+    import pyarrow as pa  # noqa: PLC0415
+
+    import tea_tasting.backends  # noqa: PLC0415
+
+    class _Table(tea_tasting.backends.BaseTable):
+        def __init__(self, data: pa.Table) -> None:
+            self.data = data
+
+        def select(self, *cols: str) -> pa.Table:
+            return self.data.select(cols) if len(cols) > 0 else self.data
+
+        def select_col_unique(self, col: str) -> list[object]:
+            return self.data[col].unique().to_pylist()
+
+        def group_by(self, by: str) -> BaseTableGroupBy:
+            raise NotImplementedError
+
+        def aggregate(
+            self,
+            aggr_cols: tea_tasting.aggr.AggrCols,
+        ) -> tea_tasting.aggr.Aggregates:
+            raise NotImplementedError
+
+    data = pa.table({
+        "a": pa.array([1.0, None, 3.0, 4.0]),
+        "b": pa.array([1.0, 2.0, None, 4.0]),
+    })
+    table = _Table(data)
+
+    filtered, total, complete = table.filter_complete(("a", "b"))
+
+    assert total == 4
+    assert complete == 2
+    assert filtered.select().num_rows == 2
+
+
+def test_base_table_filter_complete_default_empty_cols() -> None:
+    import pyarrow as pa  # noqa: PLC0415
+
+    import tea_tasting.backends  # noqa: PLC0415
+
+    class _Table(tea_tasting.backends.BaseTable):
+        def __init__(self, data: pa.Table) -> None:
+            self.data = data
+
+        def select(self, *cols: str) -> pa.Table:
+            return self.data.select(cols) if len(cols) > 0 else self.data
+
+        def select_col_unique(self, col: str) -> list[object]:  # noqa: ARG002
+            return []
+
+        def group_by(self, by: str) -> BaseTableGroupBy:
+            raise NotImplementedError
+
+        def aggregate(
+            self,
+            aggr_cols: tea_tasting.aggr.AggrCols,
+        ) -> tea_tasting.aggr.Aggregates:
+            raise NotImplementedError
+
+    data = pa.table({"a": pa.array([1.0, None, 3.0, 4.0])})
+    table = _Table(data)
+
+    filtered, total, complete = table.filter_complete(())
+
+    assert total == complete == 4
+    assert filtered is table

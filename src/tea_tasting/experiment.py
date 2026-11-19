@@ -19,7 +19,7 @@ import tea_tasting.utils
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Mapping
     from typing import Concatenate, Literal, Protocol
 
 
@@ -68,6 +68,40 @@ class ExperimentResult(
         "pvalue",
     )
     default_text_keys = ("metric",)
+
+    def __init__(
+        self,
+        *args: object,
+        populations_: (
+            Mapping[Hashable, tea_tasting.aggr.Population] | None
+        ) = None,
+        **kwargs: tea_tasting.metrics.MetricResult,
+    ) -> None:
+        """Experiment result for a pair of variants.
+
+        Args:
+            *args: Positional arguments passed to `UserDict`.
+            populations_: Populations of observations used for the analysis,
+                with variant values as keys. `None` if the analysis did not
+                use the common observations policy.
+            **kwargs: Results of individual metrics with metric names as keys.
+        """
+        super().__init__(*args, **kwargs)  # ty:ignore[no-matching-overload]
+        self.populations_ = populations_
+
+    @property
+    def populations(
+        self,
+    ) -> Mapping[Hashable, tea_tasting.aggr.Population] | None:
+        """Populations of observations used for the analysis.
+
+        The populations are keyed by variant values. `None` if the analysis
+        did not use the common observations policy.
+
+        Returns:
+            Populations of observations used for the analysis.
+        """
+        return self.populations_
 
     @tea_tasting.utils._cache_method
     def to_dicts(self) -> tuple[dict[str, object], ...]:
@@ -175,6 +209,34 @@ class ExperimentPowerResult(
     default_keys = ("metric", "power", "effect_size", "rel_effect_size", "n_obs")
     default_text_keys = ("metric",)
 
+    def __init__(
+        self,
+        *args: object,
+        population_: tea_tasting.aggr.Population | None = None,
+        **kwargs: tea_tasting.metrics.MetricPowerResults[Any],
+    ) -> None:
+        """Result of power analysis in an experiment.
+
+        Args:
+            *args: Positional arguments passed to `UserDict`.
+            population_: Population of observations used for the analysis.
+                `None` if the analysis did not use the common observations policy.
+            **kwargs: Power analysis results with metric names as keys.
+        """
+        super().__init__(*args, **kwargs)  # ty:ignore[no-matching-overload]
+        self.population_ = population_
+
+    @property
+    def population(self) -> tea_tasting.aggr.Population | None:
+        """Population of observations used for the analysis.
+
+        `None` if the analysis did not use the common observations policy.
+
+        Returns:
+            Population of observations used for the analysis.
+        """
+        return self.population_
+
     @tea_tasting.utils._cache_method
     def to_dicts(self) -> tuple[dict[str, object], ...]:
         """Convert the result to a sequence of dictionaries."""
@@ -189,6 +251,8 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
         self,
         metrics: dict[str, tea_tasting.metrics.MetricBase[Any]] | None = None,
         variant: str = "variant",
+        *,
+        common_observations: tea_tasting.aggr.CommonObservationsPolicy | None = None,
         **kw_metrics: tea_tasting.metrics.MetricBase[Any],
     ) -> None:
         """Experiment definition: metrics and variant column.
@@ -196,6 +260,19 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
         Args:
             metrics: Dictionary of metrics with metric names as keys.
             variant: Variant column name.
+            common_observations: Policy for handling missing values across metrics:
+
+                - `None`: each statistic uses all observations that define it,
+                    so different metrics (and means and covariances within
+                    a metric) can be calculated on different subsets of
+                    observations. Default.
+                - `"drop"`: calculate a single completeness mask from
+                    the dependency columns of all selected metrics, apply it
+                    to the raw data, and use the filtered data for all metrics,
+                    so all metrics share the same population of observations.
+                - `"raise"`: like `"drop"`, but raise an error if the mask
+                    excludes any observation.
+
             kw_metrics: Metrics with metric names as parameter names.
 
         Examples:
@@ -289,6 +366,12 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
         self.metrics = metrics
         self.variant = tea_tasting.utils.check_scalar(
             variant, "variant", typ=str)
+        self.common_observations = tea_tasting.utils.check_scalar(
+            common_observations,
+            "common_observations",
+            typ=str | None,
+            in_={None, "drop", "raise"},
+        )
 
 
     @overload
@@ -329,9 +412,14 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
 
         Returns:
             Experiment result.
+
+        Raises:
+            ValueError: If `common_observations` is `"raise"` and incomplete
+                observations are found, or if aggregated data does not define
+                the population contract required by `common_observations`.
         """
         tea_tasting.utils.check_scalar(all_variants, "all_variants", typ=bool)
-        aggregated_data, granular_data = self._read_data(data)
+        data, aggregated_data, granular_data, populations = self._read_data(data)
         variants = self._read_variants(data, aggregated_data, granular_data)
         variant_pairs = self._get_variant_pairs(variants, control)
 
@@ -351,6 +439,14 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
                     control=contr,
                     treatment=treat,
                 )}
+            result.populations_ = (
+                None
+                if populations is None
+                else {
+                    variant: populations[variant]
+                    for variant in (contr, treat)
+                }
+            )
 
             if not all_variants:
                 return result
@@ -364,8 +460,10 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
         self,
         data: tea_tasting.data.Table | tea_tasting.data.AggregatesByVariant,
     ) -> tuple[
+        tea_tasting.data.Table | tea_tasting.data.AggregatesByVariant,
         tea_tasting.data.AggregatesByVariant | None,
         tea_tasting.data.TablesByVariant | None,
+        Mapping[Hashable, tea_tasting.aggr.Population] | None,
     ]:
         if tea_tasting.data._is_aggregates_mapping(data):
             for name, metric in self.metrics.items():
@@ -374,29 +472,119 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
                         "Aggregated data was provided, but metric "
                         f"{name!r} is not based on aggregated statistics.",
                     )
-            return data, None
+            populations = (
+                None
+                if self.common_observations is None
+                else self._validate_aggregates_populations(data)
+            )
+            return data, data, None, populations
 
         aggr_cols = tea_tasting.aggr.AggrCols()
-        gran_cols = set()
+        gran_cols: set[str] = set()
         for metric in self.metrics.values():
             if isinstance(metric, tea_tasting.metrics.MetricBaseAggregated):
                 aggr_cols |= metric.aggr_cols
             if isinstance(metric, tea_tasting.metrics.MetricBaseGranular):
                 gran_cols |= set(metric.cols)
 
+        if self.common_observations is None:
+            aggregated_data = tea_tasting.data.read_aggregates(
+                data,
+                aggr_cols=aggr_cols,
+                variant=self.variant,
+            ) if len(aggr_cols) > 0 else None
+
+            granular_data = tea_tasting.data.read_granular(
+                data,
+                cols=tuple(gran_cols),
+                variant=self.variant,
+            ) if len(gran_cols) > 0 else None
+
+            return data, aggregated_data, granular_data, None
+
+        dep_cols = (*aggr_cols.dep_cols, *sorted(gran_cols))
+        aggr_cols |= tea_tasting.aggr.AggrCols(has_count=True)
+        raw_data: tea_tasting.data.Table = data  # ty:ignore[invalid-assignment]
+        filtered_data, total_count, complete_count = (
+            tea_tasting.data.filter_complete(raw_data, dep_cols)
+        )
+        if self.common_observations == "raise" and complete_count != total_count:
+            raise ValueError(
+                "Incomplete observations were found: "
+                f"{total_count - complete_count} of {total_count} observations "
+                f"have null values in columns {dep_cols!r}, "
+                "and common_observations is 'raise'.",
+            )
+
         aggregated_data = tea_tasting.data.read_aggregates(
-            data,
+            filtered_data,
             aggr_cols=aggr_cols,
             variant=self.variant,
-        ) if len(aggr_cols) > 0 else None
-
+        )
         granular_data = tea_tasting.data.read_granular(
-            data,
+            filtered_data,
             cols=tuple(gran_cols),
             variant=self.variant,
         ) if len(gran_cols) > 0 else None
 
-        return aggregated_data, granular_data
+        fingerprint = tea_tasting.aggr.population_fingerprint(dep_cols)
+        populations = {
+            variant: tea_tasting.aggr.Population(
+                fingerprint=fingerprint,
+                count=aggr.count(),
+                columns=dep_cols,
+            )
+            for variant, aggr in aggregated_data.items()
+        }
+
+        return filtered_data, aggregated_data, granular_data, populations
+
+
+    def _validate_aggregates_populations(
+        self,
+        data: tea_tasting.data.AggregatesByVariant,
+    ) -> dict[Hashable, tea_tasting.aggr.Population]:
+        dep_cols: dict[str, None] = {}
+        for metric in self.metrics.values():
+            if isinstance(metric, tea_tasting.metrics.MetricBaseAggregated):
+                for col in metric.aggr_cols.dep_cols:
+                    dep_cols[col] = None
+
+        populations: dict[Hashable, tea_tasting.aggr.Population] = {}
+        fingerprints: set[str] = set()
+        for variant, aggr in data.items():
+            population = aggr.population_
+            if population is None:
+                raise ValueError(
+                    "Aggregated data does not define a population contract, "
+                    f"but common_observations is {self.common_observations!r}. "
+                    "Recompute the aggregates with a population, for example "
+                    "using tea_tasting.data.read_aggregates on a filtered table.",
+                )
+            missing = sorted(set(dep_cols) - set(population.columns))
+            if missing:
+                raise ValueError(
+                    f"The population contract of variant {variant!r} does not "
+                    f"include columns {missing!r} required by the metrics, "
+                    "so some statistics may be calculated on different "
+                    "subsets of observations.",
+                )
+            if aggr.count_ is not None and aggr.count_ != population.count:
+                raise ValueError(
+                    f"The sample size of variant {variant!r} is {aggr.count_}, "
+                    f"but its population size is {population.count}. "
+                    "Statistics may not be calculated on the declared population.",
+                )
+            fingerprints.add(population.fingerprint)
+            populations[variant] = population
+
+        if len(fingerprints) > 1:
+            raise ValueError(
+                "Variants have different population fingerprints: "
+                f"{sorted(fingerprints)!r}.",
+            )
+
+        return populations
 
 
     def _read_variants(
@@ -483,6 +671,26 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
             if isinstance(metric, tea_tasting.metrics.PowerBaseAggregated):
                 aggr_cols |= metric.aggr_cols
 
+        population = None
+        if self.common_observations is not None and len(aggr_cols) > 0:
+            filtered_data, total_count, complete_count = (
+                tea_tasting.data.filter_complete(data, aggr_cols.dep_cols)
+            )
+            if self.common_observations == "raise" and complete_count != total_count:
+                raise ValueError(
+                    "Incomplete observations were found: "
+                    f"{total_count - complete_count} of {total_count} observations "
+                    f"have null values in columns {aggr_cols.dep_cols!r}, "
+                    "and common_observations is 'raise'.",
+                )
+            data = filtered_data
+            population = tea_tasting.aggr.Population(
+                fingerprint=tea_tasting.aggr.population_fingerprint(
+                    aggr_cols.dep_cols),
+                count=complete_count,
+                columns=aggr_cols.dep_cols,
+            )
+
         aggr_data = tea_tasting.data.read_aggregates(
             data,
             aggr_cols=aggr_cols,
@@ -494,6 +702,7 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
                 result |= {name: metric.solve_power(aggr_data, parameter=parameter)}  # ty:ignore[unsupported-operator]
             elif isinstance(metric, tea_tasting.metrics.PowerBase):
                 result |= {name: metric.solve_power(data, parameter=parameter)}  # ty:ignore[unsupported-operator, invalid-argument-type]
+        result.population_ = population
 
         return result
 

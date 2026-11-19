@@ -20,7 +20,7 @@ import tea_tasting.utils
 
 
 if TYPE_CHECKING:
-    from collections.abc import Hashable
+    from collections.abc import Hashable, Sequence
 
     import pyarrow as pa
 
@@ -249,6 +249,60 @@ class SQLQuery(BaseTable):  # noqa: D101
         """
         return _aggregate(self, aggr_cols)
 
+    def filter_complete(
+        self,
+        cols: Sequence[str],
+    ) -> tuple[SQLQuery, int, int]:
+        """Select rows that have no null values in the specified columns.
+
+        Args:
+            cols: Columns that must not be null.
+
+        Returns:
+            A tuple of the filtered query adapter, the total number of rows,
+            and the number of rows with no null values in `cols`.
+        """
+        query = self.query.copy().subquery(_SUBQUERY)  # ty:ignore[missing-attribute]
+        count_query = sqlglot.exp.select(
+            sqlglot.exp.alias_(
+                sqlglot.exp.Count(this=sqlglot.exp.Star()),
+                _COUNT,
+            ),
+        ).from_(query)
+        with tea_tasting.backends._executor.Executor(self.connection) as executor:
+            total = _count(executor.execute(
+                count_query.sql(dialect=self.dialect)))
+
+        if len(cols) == 0:
+            return self, total, total
+
+        valid = _valid_condition(cols)
+        filtered_query = sqlglot.exp.select(sqlglot.exp.Star()).from_(
+            query,
+        ).where(valid)
+        complete_query = sqlglot.exp.select(
+            sqlglot.exp.alias_(
+                sqlglot.exp.Count(this=sqlglot.exp.Star()),
+                _COUNT,
+            ),
+        ).from_(query).where(valid.copy())
+        with tea_tasting.backends._executor.Executor(self.connection) as executor:
+            complete = _count(executor.execute(
+                complete_query.sql(dialect=self.dialect)))
+
+        return (
+            SQLQuery(
+                filtered_query,
+                self.connection,
+                self.dialect,  # ty:ignore[invalid-argument-type]
+                var=self.var,
+                cov=self.cov,
+                chunk_size=self.chunk_size,
+            ),
+            total,
+            complete,
+        )
+
 
 class SQLQueryGroupBy(BaseTableGroupBy):  # noqa: D101
     def __init__(
@@ -469,6 +523,23 @@ def _mean_over(
 
 def _float(col: str) -> sqlglot.exp.Expression:
     return sqlglot.exp.cast(_col(col), "DOUBLE")
+
+
+def _valid_condition(cols: Sequence[str]) -> sqlglot.exp.Expression:
+    condition: sqlglot.exp.Expression = _col(cols[0]).is_(
+        sqlglot.exp.Null(),
+    ).not_()
+    for col in cols[1:]:
+        condition = sqlglot.exp.and_(  # ty:ignore[invalid-assignment]
+            condition,
+            _col(col).is_(sqlglot.exp.Null()).not_(),
+        )
+    return condition
+
+
+def _count(executor: tea_tasting.backends._executor.Executor) -> int:
+    rows = executor.to_dicts()
+    return int(rows[0][_COUNT] or 0)
 
 
 def _col(col: str) -> sqlglot.exp.Column:

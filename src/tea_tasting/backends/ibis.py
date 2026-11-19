@@ -17,7 +17,7 @@ import tea_tasting.utils
 
 
 if TYPE_CHECKING:
-    from collections.abc import Hashable
+    from collections.abc import Hashable, Sequence
 
     import ibis.expr.types
     import pyarrow as pa
@@ -118,6 +118,37 @@ class IbisTable(BaseTable):  # noqa: D101
             Aggregated statistics.
         """
         return _aggregate(self, aggr_cols)
+
+    def filter_complete(
+        self,
+        cols: Sequence[str],
+    ) -> tuple[IbisTable, int, int]:
+        """Select rows that have no null values in the specified columns.
+
+        Args:
+            cols: Columns that must not be null.
+
+        Returns:
+            A tuple of the filtered table adapter, the total number of rows,
+            and the number of rows with no null values in `cols`.
+        """
+        data = self.data
+        total = int(data.count().to_pyarrow().as_py())
+        if len(cols) == 0:
+            return self, total, total
+
+        filtered = data.filter([data[col].notnull() for col in cols])
+        complete = int(filtered.count().to_pyarrow().as_py())
+        return (
+            IbisTable(
+                filtered,
+                has_var=self.has_var,
+                has_cov=self.has_cov,
+                chunk_size=self.chunk_size,
+            ),
+            total,
+            complete,
+        )
 
 
 class IbisTableGroupBy(BaseTableGroupBy):  # noqa: D101

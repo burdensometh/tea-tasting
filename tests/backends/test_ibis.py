@@ -428,3 +428,39 @@ def test_ibis_table_group_by_aggregate_nulls(
     assert set(aggrs) == {0, 1}
     for variant, expected_aggr in expected.items():
         _compare_aggrs(aggrs[variant], expected_aggr)
+
+
+def test_ibis_table_filter_complete() -> None:
+    import ibis  # noqa: PLC0415
+
+    data = pa.table({
+        "a": pa.array([1.0, None, 3.0, 4.0]),
+        "b": pa.array([1.0, 2.0, None, 4.0]),
+    })
+    adapter = tea_tasting.backends.ibis.IbisTable(
+        ibis.memtable(data),
+        has_var=False,
+        has_cov=True,
+        chunk_size=10,
+    )
+
+    filtered, total, complete = adapter.filter_complete(("a", "b"))
+
+    assert total == 4
+    assert complete == 2
+    assert filtered.select().num_rows == 2
+    assert filtered.has_var is False
+    assert filtered.has_cov is True
+    assert filtered.chunk_size == 10
+
+
+def test_ibis_table_filter_complete_empty_cols() -> None:
+    import ibis  # noqa: PLC0415
+
+    data = pa.table({"a": pa.array([1.0, None, 3.0, 4.0])})
+    adapter = tea_tasting.backends.ibis.IbisTable(ibis.memtable(data))
+
+    filtered, total, complete = adapter.filter_complete(())
+
+    assert total == complete == 4
+    assert filtered is adapter

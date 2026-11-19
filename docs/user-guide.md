@@ -289,6 +289,43 @@ revenue_per_user      5.24      5.73       0.489     [-0.133, 1.11]
 
 ## More features
 
+### Missing values
+
+By default, each statistic is calculated on all observations that define it (that have no `null` values in the required columns). As a result, different statistics can be calculated on different subsets of observations. A mean and a variance of the same metric can come from different populations, and covariances can use yet another subset. When data is pre-aggregated, these populations are no longer recoverable from the aggregated statistics.
+
+To make all selected metrics share a single population of observations, set `common_observations` in the `Experiment` constructor:
+
+- `"drop"`: calculate a single completeness mask from the columns required by all selected metrics, apply it to the raw data, and use the filtered data for all metrics.
+- `"raise"`: do the same, but raise an error if the mask excludes any observation.
+
+```pycon
+>>> import pyarrow as pa
+
+>>> data_missing = data.set_column(
+...     data.schema.get_field_index("revenue"),
+...     "revenue",
+...     pa.array(
+...         [None] * 10 + data["revenue"].to_pylist()[10:],
+...         type=data["revenue"].type,
+...     ),
+... )
+>>> experiment_missing = tt.Experiment(
+...     orders_per_user=tt.Mean("orders"),
+...     revenue_per_user=tt.Mean("revenue"),
+...     common_observations="drop",
+... )
+>>> result_missing = experiment_missing.analyze(data_missing)
+>>> result_missing.populations
+{0: Population(fingerprint='26a792a264824db0', count=2019, columns=('orders', 'revenue')), 1: Population(fingerprint='26a792a264824db0', count=1971, columns=('orders', 'revenue'))}
+
+```
+
+The result exposes the actual population in the `populations` attribute: the population fingerprint, the columns every included observation defines, and the number of observations per variant. All metrics in the result use this population. Statistics that require a subset of the population raise an error rather than silently using a smaller sample.
+
+Experiments analyzed with the default `common_observations=None` keep the previous behavior and do not expose a population.
+
+When input data is a mapping of pre-aggregated statistics, tea-tasting requires each variant's aggregates to declare the population contract. Attach it with `Aggregates.with_population`, and tea-tasting verifies that the declared columns cover all metric dependencies, that the sample size matches the declared population, and that all variants share the same fingerprint. Inputs without a population contract are rejected when `common_observations` is set.
+
 ### Variance reduction with CUPED/CUPAC
 
 tea-tasting supports variance reduction with CUPED/CUPAC, within both [`Mean`](api/metrics/mean.md#tea_tasting.metrics.mean.Mean) and [`RatioOfMeans`](api/metrics/mean.md#tea_tasting.metrics.mean.RatioOfMeans) classes.

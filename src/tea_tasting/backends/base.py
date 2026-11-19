@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import abc
+import functools
 import math
 from typing import TYPE_CHECKING, overload
+
+import pyarrow as pa
+import pyarrow.compute as pc
 
 import tea_tasting.aggr
 
@@ -12,13 +16,13 @@ import tea_tasting.aggr
 if TYPE_CHECKING:
     from collections.abc import Hashable, Mapping, Sequence
 
-    import pyarrow as pa
-
 
 _COUNT = "__count__"
 _MEAN = "__mean__{}__"
 _VAR = "__var__{}__"
 _COV = "__cov__{}__{}__"
+_TOTAL_COUNT = "__total_count__"
+_COMPLETE_COUNT = "__complete_count__"
 
 
 class BaseTable(abc.ABC):
@@ -70,6 +74,44 @@ class BaseTable(abc.ABC):
         Returns:
             Aggregated statistics.
         """
+
+    def filter_complete(
+        self,
+        cols: Sequence[str],
+    ) -> tuple[BaseTable, int, int]:
+        """Select rows that have no null values in the specified columns.
+
+        This default implementation fetches the table as a PyArrow Table.
+        Backend adapters can override it to filter data in the backend.
+
+        Args:
+            cols: Columns that must not be null.
+
+        Returns:
+            A tuple of the filtered table, the total number of rows,
+            and the number of rows with no null values in `cols`.
+        """
+        if len(cols) == 0:
+            data = self.select()
+            return self, data.num_rows, data.num_rows
+
+        data = self.select()
+        mask = _complete_mask(data, cols)
+        complete = int(
+            pc.sum(  # ty:ignore[missing-attribute]
+                pc.cast(mask, pa.int64()),
+            ).as_py() or 0,
+        )
+        from tea_tasting.backends.narwhals import NarwhalsFrame  # noqa: PLC0415
+
+        return NarwhalsFrame(data.filter(mask)), data.num_rows, complete
+
+
+def _complete_mask(data: pa.Table, cols: Sequence[str]) -> pa.ChunkedArray:
+    return functools.reduce(
+        pc.and_,  # ty:ignore[missing-attribute]
+        (pc.is_valid(data[col]) for col in cols),  # ty:ignore[missing-attribute]
+    )
 
 
 class BaseTableGroupBy(abc.ABC):

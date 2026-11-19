@@ -121,3 +121,144 @@ def test_aggregates_add(
     assert aggrs_add.mean_ == pytest.approx(correct_aggr.mean_)
     assert aggrs_add.var_ == pytest.approx(correct_aggr.var_)
     assert aggrs_add.cov_ == pytest.approx(correct_aggr.cov_)
+
+
+def test_aggr_cols_dep_cols() -> None:
+    aggr_cols = tea_tasting.aggr.AggrCols(
+        has_count=True,
+        mean_cols=("a", "b"),
+        var_cols=("b", "c"),
+        cov_cols=(("b", "d"), ("e", "a")),
+    )
+    assert aggr_cols.dep_cols == ("a", "b", "c", "d", "e")
+
+
+def test_aggr_cols_dep_cols_empty() -> None:
+    assert tea_tasting.aggr.AggrCols(has_count=True).dep_cols == ()
+
+
+def test_population_init() -> None:
+    population = tea_tasting.aggr.Population(
+        fingerprint="abc",
+        count=10,
+        columns=("a", "b", "a"),
+    )
+    assert population.fingerprint == "abc"
+    assert population.count == 10
+    assert population.columns == ("a", "b")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "exc"),
+    [
+        ({"fingerprint": 1, "count": 10}, TypeError),
+        ({"fingerprint": "abc", "count": -1}, ValueError),
+        ({"fingerprint": "abc", "count": 1.0}, TypeError),
+        ({"fingerprint": "abc", "count": 10, "columns": (1,)}, TypeError),
+    ],
+)
+def test_population_init_invalid(
+    kwargs: dict[str, object],
+    exc: type[Exception],
+) -> None:
+    with pytest.raises(exc):
+        tea_tasting.aggr.Population(**kwargs)  # ty: ignore[invalid-argument-type]
+
+
+def test_population_fingerprint_is_order_independent() -> None:
+    assert tea_tasting.aggr.population_fingerprint(("a", "b")) == (
+        tea_tasting.aggr.population_fingerprint(("b", "a"))
+    )
+    assert tea_tasting.aggr.population_fingerprint(("a", "b")) != (
+        tea_tasting.aggr.population_fingerprint(("a", "c"))
+    )
+    assert tea_tasting.aggr.population_fingerprint(("a", "b")) != (
+        tea_tasting.aggr.population_fingerprint(("a",))
+    )
+
+
+def test_aggregates_with_population() -> None:
+    aggr = tea_tasting.aggr.Aggregates(
+        count_=10,
+        mean_={"a": 1},
+        var_={"a": 2},
+        cov_={},
+    ).with_population(("a",))
+    assert isinstance(aggr.population_, tea_tasting.aggr.Population)
+    assert aggr.population_.count == 10
+    assert aggr.population_.columns == ("a",)
+    assert aggr.population_.fingerprint == tea_tasting.aggr.population_fingerprint(
+        ("a",),
+    )
+    assert aggr.population is aggr.population_
+
+
+def test_aggregates_with_population_custom_fingerprint() -> None:
+    aggr = tea_tasting.aggr.Aggregates(count_=10).with_population(
+        ("a",),
+        fingerprint="custom",
+    )
+    assert aggr.population_ is not None
+    assert aggr.population_.fingerprint == "custom"
+
+
+def test_aggregates_with_population_requires_count() -> None:
+    with pytest.raises(ValueError, match="sample size"):
+        tea_tasting.aggr.Aggregates().with_population(("a",))
+
+
+def test_aggregates_with_zero_div_preserves_population() -> None:
+    population = tea_tasting.aggr.Population("abc", 10, ("a",))
+    aggr = tea_tasting.aggr.Aggregates(
+        count_=10,
+        mean_={"a": 1},
+        population_=population,
+    ).with_zero_div()
+    assert aggr.population_ is population
+
+
+def test_aggregates_add_populations() -> None:
+    population = tea_tasting.aggr.Population("abc", 10, ("a",))
+    left = tea_tasting.aggr.Aggregates(
+        count_=10,
+        mean_={"a": 1},
+        population_=population,
+    )
+    right = tea_tasting.aggr.Aggregates(
+        count_=15,
+        mean_={"a": 2},
+        population_=tea_tasting.aggr.Population("abc", 15, ("a",)),
+    )
+    total = left + right
+    assert total.population_ is not None
+    assert total.population_.fingerprint == "abc"
+    assert total.population_.count == 25
+    assert total.population_.columns == ("a",)
+
+
+@pytest.mark.parametrize(
+    ("left_population", "right_population"),
+    [
+        (None, tea_tasting.aggr.Population("abc", 1, ("a",))),
+        (tea_tasting.aggr.Population("abc", 1, ("a",)), None),
+        (
+            tea_tasting.aggr.Population("abc", 1, ("a",)),
+            tea_tasting.aggr.Population("xyz", 1, ("b",)),
+        ),
+    ],
+)
+def test_aggregates_add_populations_unknown(
+    left_population: tea_tasting.aggr.Population | None,
+    right_population: tea_tasting.aggr.Population | None,
+) -> None:
+    left = tea_tasting.aggr.Aggregates(
+        count_=1,
+        mean_={"a": 1},
+        population_=left_population,
+    )
+    right = tea_tasting.aggr.Aggregates(
+        count_=1,
+        mean_={"a": 2},
+        population_=right_population,
+    )
+    assert (left + right).population_ is None

@@ -404,3 +404,41 @@ def test_sql_query_sqlite_uses_fallback() -> None:
     )
     assert aggr.var_ == pytest.approx({"x": 1.0})
     assert aggr.cov_ == pytest.approx({("x", "y"): 2.0})
+
+
+def test_sql_query_filter_complete() -> None:
+    data = pa.table({
+        "a": pa.array([1.0, None, 3.0, 4.0]),
+        "b": pa.array([1.0, 2.0, None, 4.0]),
+    })
+    adapter = _duckdb_query(data)
+
+    filtered, total, complete = adapter.filter_complete(("a", "b"))
+
+    assert total == 4
+    assert complete == 2
+    assert filtered.select().num_rows == 2
+    assert filtered.var == adapter.var
+    assert filtered.cov == adapter.cov
+    assert filtered.chunk_size == adapter.chunk_size
+
+
+def test_sql_query_filter_complete_empty_cols() -> None:
+    data = pa.table({
+        "a": pa.array([1.0, None, 3.0, 4.0]),
+    })
+    adapter = _duckdb_query(data)
+
+    filtered, total, complete = adapter.filter_complete(())
+
+    assert total == complete == 4
+    assert filtered is adapter
+
+
+def test_sql_query_filter_complete_sqlite(
+    data_sql_sqlite: tea_tasting.backends.sql.SQLQuery,
+) -> None:
+    filtered, total, complete = data_sql_sqlite.filter_complete(
+        ("sessions", "orders"),
+    )
+    assert total == complete == filtered.select().num_rows == 100

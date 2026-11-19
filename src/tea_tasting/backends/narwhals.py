@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import functools
+import operator
 from typing import TYPE_CHECKING, overload
 
 import narwhals as nw
 import narwhals.typing
 
 from tea_tasting.backends.base import (
+    _COMPLETE_COUNT,
     _COUNT,
     _COV,
     _MEAN,
+    _TOTAL_COUNT,
     _VAR,
     BaseTable,
     BaseTableGroupBy,
@@ -20,7 +24,7 @@ import tea_tasting.utils
 
 
 if TYPE_CHECKING:
-    from collections.abc import Hashable
+    from collections.abc import Hashable, Sequence
     from typing import Literal
 
     import pyarrow as pa
@@ -127,6 +131,37 @@ class NarwhalsFrame(BaseTable):  # noqa: D101
             Aggregated statistics.
         """
         return _aggregate(self, aggr_cols)
+
+    def filter_complete(
+        self,
+        cols: Sequence[str],
+    ) -> tuple[NarwhalsFrame, int, int]:
+        """Select rows that have no null values in the specified columns.
+
+        Args:
+            cols: Columns that must not be null.
+
+        Returns:
+            A tuple of the filtered frame adapter, the total number of rows,
+            and the number of rows with no null values in `cols`.
+        """
+        frame = self._frame
+        total = frame.select(nw.len().alias(_TOTAL_COUNT)).collect().item(0, 0)
+        if len(cols) == 0:
+            return self, int(total), int(total)
+
+        predicate = functools.reduce(
+            operator.and_,
+            (~nw.col(col).is_null() for col in cols),
+        )
+        complete = (
+            frame.filter(predicate)
+            .select(nw.len().alias(_COMPLETE_COUNT))
+            .collect()
+            .item(0, 0)
+        )
+        filtered = self.__class__(self._frame.filter(predicate), cov=self.cov)
+        return filtered, int(total), int(complete)
 
 
 class NarwhalsFrameGroupBy(BaseTableGroupBy):  # noqa: D101

@@ -403,6 +403,21 @@ def test_experiment_init_custom() -> None:
     experiment = tea_tasting.experiment.Experiment(metrics, "group")  # ty:ignore[invalid-argument-type]
     assert experiment.metrics == metrics
     assert experiment.variant == "group"
+    assert experiment.common_observations is None
+
+
+def test_experiment_init_common_observations() -> None:
+    experiment = tea_tasting.experiment.Experiment({
+        "avg_orders": _MetricAggregated("orders"),
+    }, common_observations="drop")
+    assert experiment.common_observations == "drop"
+
+
+def test_experiment_init_common_observations_invalid() -> None:
+    with pytest.raises(ValueError, match="common_observations"):
+        tea_tasting.experiment.Experiment({
+            "avg_orders": _MetricAggregated("orders"),
+        }, common_observations="invalid")  # ty:ignore[invalid-argument-type]
 
 
 def test_experiment_analyze_default(
@@ -563,6 +578,275 @@ def test_experiment_solve_power(data_arrow: pa.Table) -> None:
             {"power": 0.9, "effect_size": 2, "rel_effect_size": 0.1, "n_obs": 20_000},
         )),
     })
+
+
+@pytest.fixture
+def data_arrow_nulls(data_arrow: pa.Table) -> pa.Table:
+    revenue = data_arrow["revenue"].to_pylist()
+    for i in (0, 1, 2, 3, 4):
+        revenue[i] = None
+    data = data_arrow.set_column(
+        data_arrow.schema.get_field_index("revenue"),
+        "revenue",
+        pa.array(revenue, type=data_arrow["revenue"].type),
+    )
+    if "orders_covariate" in data.column_names:
+        orders_covariate = data["orders_covariate"].to_pylist()
+        for i in (5, 6, 7):
+            orders_covariate[i] = None
+        data = data.set_column(
+            data.schema.get_field_index("orders_covariate"),
+            "orders_covariate",
+            pa.array(
+                orders_covariate,
+                type=data["orders_covariate"].type,
+            ),
+        )
+    return data
+
+
+def test_experiment_analyze_common_observations_fixes_population(
+    data_arrow_nulls: pa.Table,
+) -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        orders_per_user=tea_tasting.metrics.Mean("orders"),
+        revenue_per_user=tea_tasting.metrics.Mean("revenue"),
+        common_observations="drop",
+    )
+    result = experiment.analyze(data_arrow_nulls)
+
+    assert result.populations_ is not None
+    assert set(result.populations_) == {0, 1}
+    fingerprints = {
+        population.fingerprint for population in result.populations_.values()
+    }
+    assert len(fingerprints) == 1
+    expected_fingerprint = tea_tasting.aggr.population_fingerprint(
+        ("orders", "revenue"),
+    )
+    assert fingerprints == {expected_fingerprint}
+
+    # Every statistic uses the same filtered population.
+    data_filtered = data_arrow_nulls.filter(pc.and_(
+        pc.is_valid(data_arrow_nulls["orders"]),
+        pc.is_valid(data_arrow_nulls["revenue"]),
+    ))
+    variant_col = data_filtered["variant"]
+    for variant, population in result.populations_.items():
+        variant_data = data_filtered.filter(
+            pc.equal(variant_col, pa.scalar(variant)),
+        )
+        assert population.count == variant_data.num_rows
+        assert population.columns == ("orders", "revenue")
+
+    ref_experiment = tea_tasting.experiment.Experiment(
+        orders_per_user=tea_tasting.metrics.Mean("orders"),
+        revenue_per_user=tea_tasting.metrics.Mean("revenue"),
+    )
+    ref_result = ref_experiment.analyze(data_filtered)
+    assert result["orders_per_user"] == ref_result["orders_per_user"]
+    assert result["revenue_per_user"] == ref_result["revenue_per_user"]
+
+
+def test_experiment_analyze_common_observations_default_has_no_population(
+    data_arrow_nulls: pa.Table,
+) -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        orders_per_user=tea_tasting.metrics.Mean("orders"),
+        revenue_per_user=tea_tasting.metrics.Mean("revenue"),
+    )
+    result = experiment.analyze(data_arrow_nulls)
+    assert result.populations_ is None
+
+
+def test_experiment_analyze_common_observations_raise(
+    data_arrow_nulls: pa.Table,
+) -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        orders_per_user=tea_tasting.metrics.Mean("orders"),
+        revenue_per_user=tea_tasting.metrics.Mean("revenue"),
+        common_observations="raise",
+    )
+    with pytest.raises(ValueError, match="Incomplete observations"):
+        experiment.analyze(data_arrow_nulls)
+
+
+def test_experiment_analyze_common_observations_raise_complete(
+    data_arrow: pa.Table,
+) -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        orders_per_user=tea_tasting.metrics.Mean("orders"),
+        revenue_per_user=tea_tasting.metrics.Mean("revenue"),
+        common_observations="raise",
+    )
+    result = experiment.analyze(data_arrow)
+    assert result.populations_ is not None
+    assert {p.count for p in result.populations_.values()} == {
+        data_arrow.filter(pc.equal(
+            data_arrow["variant"], pa.scalar(0))).num_rows,
+        data_arrow.filter(pc.equal(
+            data_arrow["variant"], pa.scalar(1))).num_rows,
+    }
+
+
+def test_experiment_analyze_common_observations_granular_metric(
+    data_arrow_nulls: pa.Table,
+) -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        orders_per_user=tea_tasting.metrics.Mean("orders"),
+        revenue_users=tea_tasting.metrics.Quantile("revenue"),
+        common_observations="drop",
+    )
+    result = experiment.analyze(data_arrow_nulls)
+    assert result.populations_ is not None
+    population = result.populations_[0]
+    assert population.columns == ("orders", "revenue")
+    filtered = data_arrow_nulls.filter(pc.and_(
+        pc.is_valid(data_arrow_nulls["orders"]),
+        pc.is_valid(data_arrow_nulls["revenue"]),
+    ))
+    assert population.count == filtered.filter(
+        pc.equal(filtered["variant"], pa.scalar(0)),
+    ).num_rows
+
+
+def test_experiment_analyze_common_observations_rejects_precomputed(
+    data_arrow: pa.Table,
+) -> None:
+    aggregated = tea_tasting.data.read_aggregates(
+        data_arrow,
+        aggr_cols=tea_tasting.aggr.AggrCols(
+            has_count=True,
+            mean_cols=("orders",),
+        ),
+        variant="variant",
+    )
+    experiment = tea_tasting.experiment.Experiment(
+        orders_per_user=tea_tasting.metrics.Mean("orders"),
+        common_observations="drop",
+    )
+    with pytest.raises(ValueError, match="population contract"):
+        experiment.analyze(aggregated)
+
+
+def test_experiment_analyze_common_observations_precomputed(
+    data_arrow: pa.Table,
+) -> None:
+    aggregated = {
+        variant: aggr.with_population(("orders",))
+        for variant, aggr in tea_tasting.data.read_aggregates(
+            data_arrow,
+            aggr_cols=tea_tasting.metrics.Mean("orders").aggr_cols,
+            variant="variant",
+        ).items()
+    }
+    experiment = tea_tasting.experiment.Experiment(
+        orders_per_user=tea_tasting.metrics.Mean("orders"),
+        common_observations="drop",
+    )
+    result = experiment.analyze(aggregated)
+    assert result.populations_ is not None
+    assert {p.fingerprint for p in result.populations_.values()} == {
+        tea_tasting.aggr.population_fingerprint(("orders",)),
+    }
+
+
+def test_experiment_analyze_common_observations_precomputed_missing_columns(
+    data_arrow: pa.Table,
+) -> None:
+    aggregated = {
+        variant: aggr.with_population(("revenue",))
+        for variant, aggr in tea_tasting.data.read_aggregates(
+            data_arrow,
+            aggr_cols=tea_tasting.aggr.AggrCols(
+                has_count=True,
+                mean_cols=("orders",),
+            ),
+            variant="variant",
+        ).items()
+    }
+    experiment = tea_tasting.experiment.Experiment(
+        orders_per_user=tea_tasting.metrics.Mean("orders"),
+        common_observations="drop",
+    )
+    with pytest.raises(ValueError, match="does not"):
+        experiment.analyze(aggregated)
+
+
+def test_experiment_analyze_common_observations_precomputed_count_mismatch(
+    data_arrow: pa.Table,
+) -> None:
+    aggregated = {
+        variant: aggr.with_population(("orders",), fingerprint="fingerprint")
+        for variant, aggr in tea_tasting.data.read_aggregates(
+            data_arrow,
+            aggr_cols=tea_tasting.aggr.AggrCols(
+                has_count=True,
+                mean_cols=("orders",),
+            ),
+            variant="variant",
+        ).items()
+    }
+    aggregated[0] = tea_tasting.aggr.Aggregates(
+        count_=aggregated[0].count_ + 1,
+        mean_=aggregated[0].mean_,
+        population_=tea_tasting.aggr.Population(
+            "fingerprint",
+            aggregated[0].count_,
+            ("orders",),
+        ),
+    )
+    experiment = tea_tasting.experiment.Experiment(
+        orders_per_user=tea_tasting.metrics.Mean("orders"),
+        common_observations="drop",
+    )
+    with pytest.raises(ValueError, match="population size"):
+        experiment.analyze(aggregated)
+
+
+def test_experiment_analyze_common_observations_precomputed_fingerprint_mismatch(
+    data_arrow: pa.Table,
+) -> None:
+    aggregated = tea_tasting.data.read_aggregates(
+        data_arrow,
+        aggr_cols=tea_tasting.aggr.AggrCols(
+            has_count=True,
+            mean_cols=("orders",),
+        ),
+        variant="variant",
+    )
+    aggregated = {
+        variant: aggr.with_population(("orders",), fingerprint=str(variant))
+        for variant, aggr in aggregated.items()
+    }
+    experiment = tea_tasting.experiment.Experiment(
+        orders_per_user=tea_tasting.metrics.Mean("orders"),
+        common_observations="drop",
+    )
+    with pytest.raises(ValueError, match="fingerprint"):
+        experiment.analyze(aggregated)
+
+
+def test_experiment_result_populations_property() -> None:
+    population = tea_tasting.aggr.Population("abc", 10, ("a",))
+    result = tea_tasting.experiment.ExperimentResult(
+        {"metric": {"pvalue": 0.5}},
+        populations_={0: population},
+    )
+    assert result.populations is result.populations_
+    assert result.populations == {0: population}
+    assert tea_tasting.experiment.ExperimentResult(
+        {"metric": {"pvalue": 0.5}},
+    ).populations is None
+
+
+def test_experiment_power_result_population_property() -> None:
+    population = tea_tasting.aggr.Population("abc", 10, ("a",))
+    result = tea_tasting.experiment.ExperimentPowerResult(
+        population_=population,
+    )
+    assert result.population is population
+    assert tea_tasting.experiment.ExperimentPowerResult().population is None
 
 
 class ExperimentWithSimulationResults(tea_tasting.experiment.Experiment):
@@ -800,3 +1084,71 @@ def test_experiment_simulate_treat() -> None:
     assert means.item(2, "effect_size") == pytest.approx(0, abs=0.001)
     assert means.item(0, "effect_size") == pytest.approx(0.05, rel=0.1)
     assert means.item(1, "effect_size") == pytest.approx(0.5, rel=0.1)
+
+
+def test_experiment_solve_power_common_observations(
+    data_arrow_nulls: pa.Table,
+) -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        metric_aggr=tea_tasting.metrics.Mean("orders"),
+        common_observations="drop",
+    )
+    result = experiment.solve_power(data_arrow_nulls)
+    population = result.population
+    assert population is not None
+    assert population.fingerprint == (
+        tea_tasting.aggr.population_fingerprint(
+            tea_tasting.metrics.Mean("orders").aggr_cols.dep_cols,
+        )
+    )
+    assert population.count == data_arrow_nulls.num_rows
+
+
+def test_experiment_solve_power_common_observations_filters(
+    data_arrow_nulls: pa.Table,
+) -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        metric_aggr=tea_tasting.metrics.Mean("revenue"),
+        common_observations="drop",
+    )
+    result = experiment.solve_power(data_arrow_nulls)
+    population = result.population
+    assert population is not None
+    assert population.count == data_arrow_nulls.filter(
+        pc.is_valid(data_arrow_nulls["revenue"]),
+    ).num_rows
+
+
+def test_experiment_solve_power_common_observations_raise(
+    data_arrow_nulls: pa.Table,
+) -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        metric_aggr=tea_tasting.metrics.Mean("orders"),
+        metric_aggr2=tea_tasting.metrics.Mean("revenue"),
+        common_observations="raise",
+    )
+    with pytest.raises(ValueError, match="Incomplete observations"):
+        experiment.solve_power(data_arrow_nulls)
+
+
+def test_experiment_solve_power_common_observations_default(
+    data_arrow: pa.Table,
+) -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        metric_aggr=tea_tasting.metrics.Mean("orders"),
+    )
+    assert experiment.solve_power(data_arrow).population_ is None
+
+
+def test_experiment_simulate_common_observations(
+    data_arrow_nulls: pa.Table,
+) -> None:
+    experiment = ExperimentWithSimulationResults(
+        orders_per_user=tea_tasting.metrics.Mean("orders"),
+        revenue_per_user=tea_tasting.metrics.Mean("revenue"),
+        common_observations="drop",
+    )
+    results = experiment.simulate(data_arrow_nulls, 5, rng=42)
+    assert len(results) == 5
+    for result in results:
+        assert result.populations_ is not None

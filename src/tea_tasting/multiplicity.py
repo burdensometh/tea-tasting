@@ -433,7 +433,10 @@ def _copy_results(
                 result |= {metric: copy_of_metric_result}
                 copy_of_metric_results.append(copy_of_metric_result)
         copy_of_experiment_results |= {
-            comparison: tea_tasting.experiment.ExperimentResult(result)}
+            comparison: tea_tasting.experiment.ExperimentResult(
+                result,
+                populations_=experiment_result.populations_,
+            )}
 
     return copy_of_experiment_results, copy_of_metric_results
 

@@ -150,6 +150,30 @@ def read_variants(data: Table, variant: str) -> list[Hashable]:
     return _table(data).select_col_unique(variant)
 
 
+def filter_complete(
+    data: Table,
+    cols: Sequence[str],
+) -> tuple[tea_tasting.backends.BaseTable, int, int]:
+    """Select observations that have no null values in the specified columns.
+
+    The filter is applied to the original data before any statistics
+    are calculated, so all metrics that use the returned data share
+    the same population of observations.
+
+    Args:
+        data: Experimental data.
+        cols: Columns that observations must define (be non-null).
+
+    Returns:
+        A tuple of:
+
+        - Filtered data as a backend table adapter.
+        - Total number of observations in the input data.
+        - Number of observations with no null values in `cols`.
+    """
+    return _table(data).filter_complete(cols)
+
+
 def _table(data: Table) -> tea_tasting.backends.BaseTable:
     if isinstance(data, tea_tasting.backends.BaseTable):
         return data
