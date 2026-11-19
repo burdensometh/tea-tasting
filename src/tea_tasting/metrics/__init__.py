@@ -19,7 +19,7 @@ from tea_tasting.metrics.base import (
     PowerBase,
     PowerBaseAggregated,
 )
-from tea_tasting.metrics.mean import Mean, RatioOfMeans
+from tea_tasting.metrics.mean import CovariateFit, Mean, RatioOfMeans
 from tea_tasting.metrics.nonparametric import MannWhitneyU
 from tea_tasting.metrics.proportion import Proportion, SampleRatio
 from tea_tasting.metrics.resampling import Bootstrap, Quantile

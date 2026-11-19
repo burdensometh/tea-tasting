@@ -11,7 +11,7 @@
 
 import marimo
 
-__generated_with = "0.23.11"
+__generated_with = "0.25.2"
 app = marimo.App()
 
 
@@ -363,7 +363,7 @@ def _(tt):
     )
     result_cuped = experiment_cuped.analyze(data_cuped)
     result_cuped
-    return
+    return (data_cuped,)
 
 
 @app.cell(hide_code=True)
@@ -379,6 +379,43 @@ def _(mo):
 
     - In `Mean`, specify the covariate using the `covariate` parameter.
     - In `RatioOfMeans`, specify the covariates for the numerator and denominator using the `numer_covariate` and `denom_covariate` parameters, respectively.
+
+    #### Frozen covariate adjustment
+
+    By default, the covariate coefficient and center are estimated from the analyzed experiment data. To avoid re-estimating them on every analysis, fit a frozen adjustment on independent historical reference data and reuse it:
+    """)
+    return
+
+
+@app.cell
+def _(data_cuped, tt):
+    reference_data = tt.make_users_data(rng=43, covariates=True)
+    covariate_fit = tt.RatioOfMeans(
+        numer="orders",
+        denom="sessions",
+        numer_covariate="orders_covariate",
+        denom_covariate="sessions_covariate",
+    ).fit_covariate(reference_data)
+    covariate_fit
+    state = covariate_fit.to_dict()
+    experiment_frozen = tt.Experiment(
+        orders_per_session=tt.RatioOfMeans(
+            numer="orders",
+            denom="sessions",
+            numer_covariate="orders_covariate",
+            denom_covariate="sessions_covariate",
+            covariate_fit=state,
+        ),
+    )
+    result_frozen = experiment_frozen.analyze(data_cuped)
+    result_frozen
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    When `covariate_fit` is defined, the experiment analysis only applies the stored coefficient and center: the adjusted mean, variance, and covariance are computed with the same fixed transformation and then passed to the regular hypothesis test and power analysis. The state records the state version and the ratio definition (`numer`, `denom`, `numer_covariate`, `denom_covariate`), so an incompatible state is rejected with an error. A reference sample where the covariate ratio is degenerate (zero or non-finite variance) cannot be used for fitting.
 
     ### Sample ratio mismatch check
 

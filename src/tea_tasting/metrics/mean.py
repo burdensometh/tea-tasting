@@ -1,7 +1,7 @@
 """Metrics for the analysis of means."""
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import math
 from typing import TYPE_CHECKING, NamedTuple, overload
 
@@ -10,6 +10,7 @@ import scipy.stats
 
 import tea_tasting.aggr
 import tea_tasting.config
+import tea_tasting.data
 from tea_tasting.metrics.base import (
     MetricBaseAggregated,
     MetricPowerResults,
@@ -24,6 +25,296 @@ if TYPE_CHECKING:
 
 
 MAX_ITER = 100
+
+COVARIATE_FIT_VERSION = 1
+"""Version of the frozen covariate fit state format."""
+
+_COVARIATE_FIT_FIELDS = (
+    "version",
+    "numer",
+    "denom",
+    "numer_covariate",
+    "denom_covariate",
+    "coef",
+    "covariate_mean",
+)
+
+
+class CovariateFit(tea_tasting.utils.ReprMixin):  # noqa: D101
+    def __init__(
+        self,
+        numer: str,
+        denom: str | None,
+        numer_covariate: str,
+        denom_covariate: str | None,
+        coef: float,
+        covariate_mean: float,
+        n_obs: int | None = None,
+        version: int = COVARIATE_FIT_VERSION,
+    ) -> None:
+        """Frozen covariate adjustment estimated on historical reference data.
+
+        A frozen fit stores the covariate coefficient and the covariate center
+        (mean) together with the ratio definition they were estimated for.
+        After freezing, an experiment analysis applies the stored coefficient
+        and center to the experiment data; it never re-estimates them from the
+        experiment data.
+
+        Attributes:
+            numer: Numerator column name of the metric.
+            denom: Denominator column name of the metric.
+            numer_covariate: Covariate numerator column name.
+            denom_covariate: Covariate denominator column name.
+            coef: Covariate coefficient.
+            covariate_mean: Covariate center (mean of the covariate ratio
+                in the reference data).
+            n_obs: Number of observations in the reference data.
+            version: Version of the frozen fit state format.
+
+        References:
+            - [Deng, A., Xu, Y., Kohavi, R., & Walker, T. (2013). Improving the Sensitivity of Online Controlled Experiments by Utilizing Pre-Experiment Data](https://exp-platform.com/Documents/2013-02-CUPED-ImprovingSensitivityOfControlledExperiments.pdf).
+        """  # noqa: E501
+        self.version = tea_tasting.utils.check_scalar(
+            version,
+            "version",
+            typ=int,
+            in_={COVARIATE_FIT_VERSION},
+        )
+        self.numer = tea_tasting.utils.check_scalar(numer, "numer", typ=str)
+        self.denom = tea_tasting.utils.check_scalar(denom, "denom", typ=str | None)
+        self.numer_covariate = tea_tasting.utils.check_scalar(
+            numer_covariate,
+            "numer_covariate",
+            typ=str,
+        )
+        self.denom_covariate = tea_tasting.utils.check_scalar(
+            denom_covariate,
+            "denom_covariate",
+            typ=str | None,
+        )
+        self.coef = _finite_float(coef, "coef")
+        self.covariate_mean = _finite_float(covariate_mean, "covariate_mean")
+        self.n_obs = tea_tasting.utils.check_scalar(n_obs, "n_obs", typ=int | None)
+
+
+    @classmethod
+    def fit(
+        cls,
+        data: tea_tasting.data.Table | tea_tasting.aggr.Aggregates,
+        metric: RatioOfMeans,
+    ) -> CovariateFit:
+        """Estimate a frozen covariate fit on independent reference data.
+
+        Args:
+            data: Historical reference data. It must not be grouped by variant.
+            metric: Metric that defines the ratio and the covariate columns.
+
+        Returns:
+            Frozen covariate fit estimated on the reference data.
+
+        Raises:
+            TypeError: If `data` is grouped by variant.
+            ValueError: If the metric has no covariate, or if the covariate
+                is degenerate in the reference data (zero or non-finite
+                variance, or non-finite coefficient or center).
+        """
+        if metric.numer_covariate is None:
+            raise ValueError(
+                "Cannot fit a covariate: the metric has no `numer_covariate`.",
+            )
+        aggr = _reference_aggregates(data, metric.aggr_cols)
+        _check_aggregate_columns(aggr, metric, "Reference data")
+
+        covariate_mean = (
+            aggr.mean(metric.numer_covariate) /
+            aggr.mean(metric.denom_covariate)
+        )
+        if not _is_finite(covariate_mean):
+            raise ValueError(
+                "Cannot fit a covariate: the estimated covariate center "
+                f"is not finite ({covariate_mean!r}).",
+            )
+        covariate_var = aggr.ratio_var(
+            metric.numer_covariate, metric.denom_covariate)
+        if not _is_positive_finite(covariate_var):
+            raise ValueError(
+                "Cannot fit a covariate: the covariate ratio is degenerate, "
+                f"its variance in the reference data is {covariate_var!r}. "
+                "A non-zero finite variance is required to estimate the "
+                "covariate coefficient.",
+            )
+        coef = metric._covariate_cov(aggr) / covariate_var
+        if not _is_finite(coef):
+            raise ValueError(
+                "Cannot fit a covariate: the estimated covariate coefficient "
+                f"is not finite ({coef!r}).",
+            )
+
+        return cls(
+            numer=metric.numer,
+            denom=metric.denom,
+            numer_covariate=metric.numer_covariate,
+            denom_covariate=metric.denom_covariate,
+            coef=coef,
+            covariate_mean=covariate_mean,
+            n_obs=aggr.count_,
+        )
+
+
+    def __eq__(self, other: object) -> bool:
+        """Check whether the fits store the same state."""
+        if not isinstance(other, CovariateFit):
+            return NotImplemented
+        return self.to_dict() == other.to_dict()
+
+
+    def __hash__(self) -> int:
+        """Hash the stored state."""
+        return hash(tuple(self.to_dict().items()))
+
+
+    def to_dict(self) -> dict[str, object]:
+        """Convert the frozen fit to a dictionary.
+
+        Returns:
+            Dictionary with the state fields and the ratio definition.
+        """
+        return {
+            "version": self.version,
+            "numer": self.numer,
+            "denom": self.denom,
+            "numer_covariate": self.numer_covariate,
+            "denom_covariate": self.denom_covariate,
+            "coef": self.coef,
+            "covariate_mean": self.covariate_mean,
+            "n_obs": self.n_obs,
+        }
+
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> CovariateFit:
+        """Create a frozen fit from a dictionary.
+
+        Args:
+            data: Dictionary produced by `to_dict` or equivalent.
+
+        Returns:
+            Frozen covariate fit.
+
+        Raises:
+            ValueError: If required fields are missing, if the state version
+                is not supported, or if the state values are invalid.
+        """
+        if not isinstance(data, Mapping):
+            raise TypeError("Covariate fit state must be a mapping.")
+        missing = [field for field in _COVARIATE_FIT_FIELDS if field not in data]
+        if missing:
+            raise ValueError(
+                "Covariate fit state is missing required fields: "
+                f"{missing}.",
+            )
+
+        version = tea_tasting.utils.check_scalar(
+            data["version"], "version", typ=int)
+        if version != COVARIATE_FIT_VERSION:
+            raise ValueError(
+                f"Unsupported covariate fit version: {version!r}. "
+                f"Expected version {COVARIATE_FIT_VERSION}.",
+            )
+
+        return cls(
+            version=version,  # ty:ignore[invalid-argument-type]
+            numer=tea_tasting.utils.check_scalar(data["numer"], "numer", typ=str),  # ty:ignore[invalid-argument-type]
+            denom=tea_tasting.utils.check_scalar(
+                data["denom"], "denom", typ=str | None),  # ty:ignore[invalid-argument-type]
+            numer_covariate=tea_tasting.utils.check_scalar(
+                data["numer_covariate"],
+                "numer_covariate",
+                typ=str,
+            ),  # ty:ignore[invalid-argument-type]
+            denom_covariate=tea_tasting.utils.check_scalar(
+                data["denom_covariate"],
+                "denom_covariate",
+                typ=str | None,
+            ),  # ty:ignore[invalid-argument-type]
+            coef=data["coef"],  # ty:ignore[invalid-argument-type]
+            covariate_mean=data["covariate_mean"],  # ty:ignore[invalid-argument-type]
+            n_obs=tea_tasting.utils.check_scalar(
+                data.get("n_obs"), "n_obs", typ=int | None),  # ty:ignore[invalid-argument-type]
+        )
+
+
+def _finite_float(value: float, name: str) -> float:
+    value = tea_tasting.utils.check_scalar(value, name, typ=float | int)
+    if not _is_finite(value):
+        raise ValueError(f"{name} must be finite, got {value!r}.")
+    return float(value)
+
+
+def _is_finite(value: float) -> bool:
+    return math.isfinite(value)
+
+
+def _is_positive_finite(value: float) -> bool:
+    return _is_finite(value) and value > 0
+
+
+def _reference_aggregates(
+    data: tea_tasting.data.Table | tea_tasting.aggr.Aggregates,
+    aggr_cols: tea_tasting.aggr.AggrCols,
+) -> tea_tasting.aggr.Aggregates:
+    if tea_tasting.data._is_aggregates_mapping(data):
+        raise TypeError(
+            "Reference data for a covariate fit must be a single sample, "
+            "not aggregated statistics grouped by variant.",
+        )
+    if isinstance(data, tea_tasting.aggr.Aggregates):
+        aggr = data
+    else:
+        aggr = tea_tasting.data.read_aggregates(data, aggr_cols=aggr_cols)
+    return aggr.with_zero_div()
+
+
+def _check_aggregate_columns(
+    aggr: tea_tasting.aggr.Aggregates,
+    metric: RatioOfMeans,
+    context: str,
+) -> None:
+    mean_var_cols = tuple(
+        col for col in (
+            metric.numer,
+            metric.denom,
+            metric.numer_covariate,
+            metric.denom_covariate,
+        )
+        if col is not None
+    )
+    cov_cols = [(metric.numer, metric.denom)]
+    if metric.numer_covariate is not None:
+        cov_cols.extend(
+            (metric_col, covariate_col)
+            for metric_col in (metric.numer, metric.denom)
+            for covariate_col in (
+                metric.numer_covariate, metric.denom_covariate)
+            if metric_col is not None and covariate_col is not None
+        )
+
+    missing: list[object] = [
+        col for col in mean_var_cols
+        if col not in aggr.mean_ or col not in aggr.var_
+    ]
+    missing.extend(
+        tuple(sorted((left, right)))
+        for left, right in cov_cols
+        if left is not None and right is not None
+        and tuple(sorted((left, right))) not in aggr.cov_
+    )
+    if missing:
+        raise ValueError(
+            f"{context} is missing aggregated columns required by the metric: "
+            f"{missing}. "
+            f"Available mean columns: {sorted(aggr.mean_)}.",
+        )
 
 
 class MeanResult(NamedTuple):
@@ -97,6 +388,7 @@ class RatioOfMeans(  # noqa: D101
         effect_size: float | int | Sequence[float | int] | None = None,
         rel_effect_size: float | Sequence[float] | None = None,
         n_obs: int | Sequence[int] | None = None,
+        covariate_fit: CovariateFit | Mapping[str, object] | None = None,
     ) -> None:
         """Metric for the analysis of ratios of means.
 
@@ -129,6 +421,12 @@ class RatioOfMeans(  # noqa: D101
                 divided by the control mean. Only for the analysis of power.
             n_obs: Number of observations in the control and in the treatment together.
                 Only for the analysis of power.
+            covariate_fit: Frozen covariate fit estimated on independent
+                reference data. If `None`, the covariate coefficient and center
+                are estimated from the analyzed data (CUPED/CUPAC). If defined,
+                the metric applies the frozen coefficient and center and never
+                re-estimates them from the analyzed data. The fit must have
+                the same ratio definition as the metric.
 
         Parameter defaults:
             Defaults for parameters `alpha`, `alternative`, `confidence_level`,
@@ -172,6 +470,32 @@ class RatioOfMeans(  # noqa: D101
             >>> result
             metric             control treatment rel_effect_size rel_effect_size_ci  pvalue
             orders_per_session   0.262     0.293             12%        [4.2%, 21%] 0.00229
+
+            ```
+
+            With a frozen covariate fit estimated on reference data:
+
+            ```pycon
+            >>> reference = tt.make_users_data(rng=43, covariates=True)
+            >>> metric = tt.RatioOfMeans(
+            ...     "orders",
+            ...     "sessions",
+            ...     "orders_covariate",
+            ...     "sessions_covariate",
+            ... )
+            >>> fit = metric.fit_covariate(reference)
+            >>> experiment = tt.Experiment(
+            ...     orders_per_session=tt.RatioOfMeans(
+            ...         "orders",
+            ...         "sessions",
+            ...         "orders_covariate",
+            ...         "sessions_covariate",
+            ...         covariate_fit=fit,
+            ...     ),
+            ... )
+            >>> data = tt.make_users_data(rng=42, covariates=True)
+            >>> round(experiment.analyze(data).to_dicts()[0]["rel_effect_size"], 3)
+            0.125
 
             ```
 
@@ -299,6 +623,88 @@ class RatioOfMeans(  # noqa: D101
             if n_obs is not None
             else tea_tasting.config.get_config("n_obs")
         )
+        self.covariate_fit = self._validate_covariate_fit(covariate_fit)
+
+
+    def fit_covariate(
+        self,
+        data: tea_tasting.data.Table | tea_tasting.aggr.Aggregates,
+    ) -> CovariateFit:
+        """Fit a frozen covariate adjustment on independent reference data.
+
+        The returned fit is estimated from `data` only. Pass it to
+        a new metric via the `covariate_fit` parameter to apply the frozen
+        coefficient and center to the experiment analysis without re-estimating
+        them from the experiment data.
+
+        Args:
+            data: Historical reference data. It must not be grouped by variant.
+
+        Returns:
+            Frozen covariate fit estimated on the reference data.
+
+        Raises:
+            TypeError: If `data` is grouped by variant.
+            ValueError: If the metric has no covariate, if the reference data
+                misses the aggregated columns required by the metric, or if the
+                covariate is degenerate in the reference data.
+
+        Examples:
+            ```pycon
+            >>> import tea_tasting as tt
+
+            >>> reference = tt.make_users_data(rng=42, covariates=True)
+            >>> fit = tt.RatioOfMeans(
+            ...     "orders",
+            ...     "sessions",
+            ...     "orders_covariate",
+            ...     "sessions_covariate",
+            ... ).fit_covariate(reference)
+            >>> round(fit.coef, 3)
+            0.557
+
+            ```
+        """
+        return CovariateFit.fit(data, self)
+
+
+    def _validate_covariate_fit(
+        self,
+        covariate_fit: CovariateFit | Mapping[str, object] | None,
+    ) -> CovariateFit | None:
+        if covariate_fit is None:
+            return None
+        if isinstance(covariate_fit, Mapping):
+            covariate_fit = CovariateFit.from_dict(covariate_fit)
+        if not isinstance(covariate_fit, CovariateFit):
+            raise TypeError(
+                "covariate_fit must be an instance of CovariateFit or a mapping, "
+                f"got {type(covariate_fit).__name__}.",
+            )
+        if self.numer_covariate is None:
+            raise ValueError(
+                "covariate_fit is defined, but the metric has no "
+                "`numer_covariate` to apply it to.",
+            )
+        expected = (
+            self.numer,
+            self.denom,
+            self.numer_covariate,
+            self.denom_covariate,
+        )
+        actual = (
+            covariate_fit.numer,
+            covariate_fit.denom,
+            covariate_fit.numer_covariate,
+            covariate_fit.denom_covariate,
+        )
+        if actual != expected:
+            raise ValueError(
+                "covariate_fit ratio definition does not match the metric: "
+                f"fit (numer, denom, numer_covariate, denom_covariate)={actual!r}, "
+                f"metric={expected!r}.",
+            )
+        return covariate_fit
 
 
     @property
@@ -342,10 +748,10 @@ class RatioOfMeans(  # noqa: D101
         """
         control = control.with_zero_div()
         treatment = treatment.with_zero_div()
+        _check_aggregate_columns(control, self, "Control data")
+        _check_aggregate_columns(treatment, self, "Treatment data")
         total = control + treatment
-        covariate_coef = self._covariate_coef(total)
-        covariate_mean = total.mean(self.numer_covariate) / total.mean(
-            self.denom_covariate)
+        covariate_coef, covariate_mean = self._covariate_parameters(total)
         return self._analyze_stats(
             contr_mean=self._metric_mean(control, covariate_coef, covariate_mean),
             contr_var=self._metric_var(control, covariate_coef),
@@ -372,9 +778,8 @@ class RatioOfMeans(  # noqa: D101
             Power analysis result.
         """
         data = data.with_zero_div()
-        covariate_coef = self._covariate_coef(data)
-        covariate_mean = data.mean(self.numer_covariate) / data.mean(
-            self.denom_covariate)
+        _check_aggregate_columns(data, self, "Sample data")
+        covariate_coef, covariate_mean = self._covariate_parameters(data)
         metric_mean = self._metric_mean(data, covariate_coef, covariate_mean)
         metric_var = self._metric_var(data, covariate_coef)
 
@@ -465,6 +870,20 @@ class RatioOfMeans(  # noqa: D101
         return power, _to_seq(effect_size), _to_seq(rel_effect_size), _to_seq(n_obs)
 
 
+    def _covariate_parameters(
+        self,
+        aggr: tea_tasting.aggr.Aggregates,
+    ) -> tuple[float, float]:
+        if self.covariate_fit is not None:
+            return self.covariate_fit.coef, self.covariate_fit.covariate_mean
+        if self.numer_covariate is None:
+            return 0, 0
+        return (
+            self._covariate_coef(aggr),
+            aggr.mean(self.numer_covariate) / aggr.mean(self.denom_covariate),
+        )
+
+
     def _covariate_coef(self, aggr: tea_tasting.aggr.Aggregates) -> float:
         covariate_var = aggr.ratio_var(self.numer_covariate, self.denom_covariate)
         if covariate_var == 0:
@@ -488,6 +907,8 @@ class RatioOfMeans(  # noqa: D101
         covariate_mean: float,
     ) -> float:
         value = aggr.mean(self.numer) / aggr.mean(self.denom)
+        if self.numer_covariate is None:
+            return value
         covariate = aggr.mean(self.numer_covariate) / aggr.mean(self.denom_covariate)
         return value - covariate_coef*(covariate - covariate_mean)
 
@@ -498,6 +919,8 @@ class RatioOfMeans(  # noqa: D101
         covariate_coef: float,
     ) -> float:
         var = aggr.ratio_var(self.numer, self.denom)
+        if self.numer_covariate is None:
+            return var
         covariate_var = aggr.ratio_var(self.numer_covariate, self.denom_covariate)
         covariate_cov = self._covariate_cov(aggr)
         return (
@@ -734,6 +1157,7 @@ class Mean(RatioOfMeans):  # noqa: D101
         effect_size: float | int | Sequence[float | int] | None = None,
         rel_effect_size: float | Sequence[float] | None = None,
         n_obs: int | Sequence[int] | None = None,
+        covariate_fit: CovariateFit | Mapping[str, object] | None = None,
     ) -> None:
         """Metric for the analysis of means.
 
@@ -764,6 +1188,11 @@ class Mean(RatioOfMeans):  # noqa: D101
                 divided by the control mean. Only for the analysis of power.
             n_obs: Number of observations in the control and in the treatment together.
                 Only for the analysis of power.
+            covariate_fit: Frozen covariate fit estimated on independent
+                reference data. If `None`, the covariate coefficient and center
+                are estimated from the analyzed data (CUPED/CUPAC). If defined,
+                the metric applies the frozen coefficient and center and never
+                re-estimates them from the analyzed data.
 
         Parameter defaults:
             Defaults for parameters `alpha`, `alternative`, `confidence_level`,
@@ -867,6 +1296,7 @@ class Mean(RatioOfMeans):  # noqa: D101
             effect_size=effect_size,
             rel_effect_size=rel_effect_size,
             n_obs=n_obs,
+            covariate_fit=covariate_fit,
         )
         self.column = column
         self.covariate = covariate
