@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Hashable, Mapping
-from typing import TYPE_CHECKING, TypeGuard, overload
+from typing import TYPE_CHECKING, Literal, TypeGuard, overload
 
 import narwhals.typing
 import pyarrow as pa
@@ -11,6 +11,7 @@ import pyarrow.compute as pc
 
 import tea_tasting.aggr
 import tea_tasting.backends
+import tea_tasting.utils
 
 
 if TYPE_CHECKING:
@@ -148,6 +149,162 @@ def read_variants(data: Table, variant: str) -> list[Hashable]:
         Unique variant values.
     """
     return _table(data).select_col_unique(variant)
+
+
+def read_paired(
+    data: Table,
+    pair_id: str,
+    variant: str,
+    cols: Sequence[str] = (),
+    *,
+    missing_side: Literal["drop", "raise"] = "drop",
+) -> dict[Hashable, pa.Table]:
+    """Read pair-aligned granular experimental data.
+
+    Each matching pair contributes one control observation and one treatment
+    observation. The returned tables are aligned: the row at position `i`
+    belongs to the same `pair_id` in every variant. Rows are ordered by
+    `pair_id`, so the result does not depend on the order of observations
+    in the input data.
+
+    The function validates the pair structure before returning data:
+
+    - `pair_id` must not be null.
+    - Each variant must occur at most once in each pair. Duplicates raise
+      a `ValueError`, because a pair cannot contribute more than one
+      observation to the same side.
+    - A pair is *complete* if it contains exactly one observation of every
+      variant present in the data. Pairs with a missing side are isolated
+      according to the `missing_side` rule: they are either dropped
+      (`"drop"`) or reported with a `ValueError` (`"raise"`).
+
+    Args:
+        data: Experimental data.
+        pair_id: Pair identifier column name.
+        variant: Variant column name.
+        cols: Columns to read.
+        missing_side: Rule for pairs missing a side:
+
+            - `"drop"`: exclude incomplete pairs from the result.
+            - `"raise"`: raise an exception if any pair is incomplete.
+
+    Returns:
+        Experimental data as PyArrow Tables by variant, aligned by `pair_id`.
+        Each table contains the `pair_id` column in addition to `cols`.
+
+    Raises:
+        ValueError: If `pair_id` or `variant` contains nulls, if a pair
+            contains more than one observation of the same variant, or if
+            `missing_side="raise"` and some pairs are incomplete.
+
+    Examples:
+        ```pycon
+        >>> import pyarrow as pa
+        >>> import tea_tasting.data
+
+        >>> data = pa.table({
+        ...     "pair_id": [0, 0, 1, 1, 2],
+        ...     "variant": [0, 1, 0, 1, 0],
+        ...     "value": [1.0, 2.0, 3.0, 4.0, 5.0],
+        ... })
+        >>> paired = tea_tasting.data.read_paired(
+        ...     data, pair_id="pair_id", variant="variant", cols=("value",))
+        >>> paired[0].to_pydict()
+        {'pair_id': [0, 1], 'value': [1.0, 3.0]}
+        >>> paired[1].to_pydict()
+        {'pair_id': [0, 1], 'value': [2.0, 4.0]}
+
+        ```
+    """
+    tea_tasting.utils.check_scalar(pair_id, "pair_id", typ=str)
+    tea_tasting.utils.check_scalar(variant, "variant", typ=str)
+    tea_tasting.utils.check_scalar(
+        missing_side, "missing_side", typ=str, in_={"drop", "raise"})
+    if pair_id == variant:
+        raise ValueError("pair_id and variant must be different columns.")
+
+    names = _unique_names(cols, pair_id, variant)
+    table = _table(data).select(*names)
+
+    _check_no_nulls(table.column(pair_id), pair_id)
+    _check_no_nulls(table.column(variant), variant)
+    _check_unique_sides(table, pair_id, variant)
+
+    variants = sorted(table.column(variant).unique().to_pylist())
+    incomplete = _incomplete_pair_ids(table, pair_id, len(variants))
+    if len(incomplete) > 0:
+        if missing_side == "raise":
+            raise ValueError(
+                "Some pairs are missing a variant side: "
+                f"{_format_values(incomplete)}. "
+                "Use missing_side='drop' to exclude such pairs.",
+            )
+        table = table.filter(_not_in(table.column(pair_id), incomplete))
+
+    table = table.sort_by(pair_id)
+    return {
+        var: table.filter(
+            pc.equal(table.column(variant), pa.scalar(var)),  # ty:ignore[missing-attribute]
+        ).drop_columns(variant)
+        for var in variants
+    }
+
+
+def _unique_names(
+    cols: Sequence[str],
+    pair_id: str,
+    variant: str,
+) -> tuple[str, ...]:
+    return tuple(dict.fromkeys((pair_id, variant, *cols)))
+
+
+def _check_no_nulls(values: pa.ChunkedArray, name: str) -> None:
+    if values.null_count > 0:
+        raise ValueError(f"{name} must not contain null values.")
+
+
+def _check_unique_sides(
+    table: pa.Table,
+    pair_id: str,
+    variant: str,
+) -> None:
+    counts = (
+        table.group_by([pair_id, variant])
+        .aggregate([(pair_id, "count")])
+    )
+    count_col = counts.column_names[-1]
+    duplicates = counts.filter(
+        pc.greater(counts.column(count_col), pa.scalar(1)),  # ty:ignore[missing-attribute]
+    )
+    if duplicates.num_rows > 0:
+        pairs = duplicates.column(pair_id).to_pylist()
+        raise ValueError(
+            "Each pair must contain at most one observation per variant. "
+            f"Duplicated pair sides: {_format_values(pairs)}.",
+        )
+
+
+def _incomplete_pair_ids(
+    table: pa.Table,
+    pair_id: str,
+    n_variants: int,
+) -> list[Hashable]:
+    counts = table.group_by(pair_id).aggregate([(pair_id, "count")])
+    count_col = counts.column_names[1]
+    incomplete = counts.filter(
+        pc.not_equal(counts.column(count_col), pa.scalar(n_variants)),  # ty:ignore[missing-attribute]
+    )
+    return incomplete.column(pair_id).to_pylist()
+
+
+def _not_in(values: pa.ChunkedArray, excluded: Sequence[Hashable]) -> pa.Array:
+    return pc.invert(pc.is_in(values, value_set=pa.array(excluded)))  # ty:ignore[missing-attribute]
+
+
+def _format_values(values: Sequence[Hashable], max_values: int = 10) -> str:
+    shown = list(values[:max_values])
+    suffix = ", ..." if len(values) > max_values else ""
+    return f"{shown}{suffix}"
 
 
 def _table(data: Table) -> tea_tasting.backends.BaseTable:

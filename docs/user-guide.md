@@ -519,3 +519,41 @@ revenue_per_user      5.24      5.73            9.3%       [-2.4%, 22%]  0.123
 ```
 
 By default, tea-tasting does not adjust for multiple hypothesis testing. However, it provides several methods for multiple testing correction. For more details, see the [guide on multiple hypothesis testing](multiple-testing.md).
+
+### Matched pairs
+
+Some experiments randomize at the level of a matching pair rather than at the unit level. For example, each pair can be two users with the same pre-experiment behavior, two stores in the same region, or two time periods with similar traffic. In such designs, one unit of a pair is assigned to control and the other to treatment. Units from different pairs are independent, but the two units within a pair are not. Analyzing such data as two independent samples understates the variance and inflates the false positive rate.
+
+Tea-tasting supports matched-pairs experiments through the `pair_id` parameter of `Experiment`. When `pair_id` is set:
+
+- Every pair must contain exactly one observation of each variant. A pair can contribute only one observation per variant.
+- Pairs missing a variant side are excluded by default. Set `missing_side="raise"` to raise an exception instead.
+- Only metrics that support paired analysis can be used. Among the built-in metrics, [`Bootstrap`](api/metrics/resampling.md#tea_tasting.metrics.resampling.Bootstrap) and [`Quantile`](api/metrics/resampling.md#tea_tasting.metrics.resampling.Quantile) support paired analysis.
+- Aggregated data is rejected because aggregate statistics cannot represent the pair structure.
+- Power analysis and simulations are not available, because they cannot preserve the pair structure.
+
+Example usage:
+
+```pycon
+>>> import numpy as np
+>>> import pyarrow as pa
+
+>>> data = pa.table({
+...     "pair_id": [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5],
+...     "variant": [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1],
+...     "revenue": [10.0, 12.0, 20.0, 19.0, 30.0, 33.0, 40.0, 44.0,
+...                 50.0, 49.0, 60.0, 66.0],
+... })
+>>> experiment = tt.Experiment(
+...     revenue_per_pair=tt.Bootstrap(
+...         "revenue", np.mean, n_resamples=1000, rng=42),
+...     pair_id="pair_id",
+... )
+>>> experiment.analyze(data)
+metric           control treatment rel_effect_size rel_effect_size_ci pvalue
+revenue_per_pair    35.0      37.2            6.2%       [-1.1%, 10%]      -
+
+```
+
+The [`read_paired`](api/data.md#tea_tasting.data.read_paired) function validates and aligns paired data before analysis. To estimate effect size and confidence interval, the bootstrap resamples pair indices and applies the same indices to control and treatment. It never resamples control and treatment independently and then subtracts the two bootstrap distributions. When several paired metrics are analyzed together, they share the same set of complete pairs. The `rng` parameter of `analyze` derives a separate deterministic random stream for each metric and variant pair.
+

@@ -379,3 +379,193 @@ def test_read_variants_custom_backend(data_arrow: pa.Table) -> None:
         0,
         1,
     }
+
+
+@pytest.fixture
+def data_paired() -> pa.Table:
+    return pa.table({
+        "pair_id": [0, 0, 1, 1, 2, 2],
+        "variant": [0, 1, 1, 0, 0, 1],
+        "value": [10.0, 12.0, 19.0, 20.0, 30.0, 33.0],
+    })
+
+
+def test_read_paired(data_paired: pa.Table) -> None:
+    paired = tea_tasting.data.read_paired(
+        data_paired,
+        pair_id="pair_id",
+        variant="variant",
+        cols=("value",),
+    )
+    assert set(paired) == {0, 1}
+    assert paired[0].to_pydict() == {
+        "pair_id": [0, 1, 2],
+        "value": [10.0, 20.0, 30.0],
+    }
+    assert paired[1].to_pydict() == {
+        "pair_id": [0, 1, 2],
+        "value": [12.0, 19.0, 33.0],
+    }
+
+
+def test_read_paired_row_order_independent(data_paired: pa.Table) -> None:
+    expected = tea_tasting.data.read_paired(
+        data_paired,
+        pair_id="pair_id",
+        variant="variant",
+        cols=("value",),
+    )
+    shuffled = data_paired.take(pa.array([5, 0, 3, 2, 4, 1]))
+    actual = tea_tasting.data.read_paired(
+        shuffled,
+        pair_id="pair_id",
+        variant="variant",
+        cols=("value",),
+    )
+    for var in expected:
+        assert actual[var].equals(expected[var])
+
+
+def test_read_paired_no_cols(data_paired: pa.Table) -> None:
+    paired = tea_tasting.data.read_paired(
+        data_paired,
+        pair_id="pair_id",
+        variant="variant",
+    )
+    assert paired[0].column_names == ["pair_id"]
+    assert paired[1].column_names == ["pair_id"]
+
+
+def test_read_paired_drops_incomplete(data_paired: pa.Table) -> None:
+    data = pa.concat_tables((
+        data_paired,
+        pa.table({
+            "pair_id": [3, 4],
+            "variant": [0, 1],
+            "value": [1.0, 2.0],
+        }),
+    ))
+    paired = tea_tasting.data.read_paired(
+        data,
+        pair_id="pair_id",
+        variant="variant",
+        cols=("value",),
+    )
+    assert paired[0]["pair_id"].to_pylist() == [0, 1, 2]
+    assert paired[1]["pair_id"].to_pylist() == [0, 1, 2]
+
+
+def test_read_paired_raises_for_incomplete(data_paired: pa.Table) -> None:
+    data = pa.concat_tables((
+        data_paired,
+        pa.table({"pair_id": [3], "variant": [0], "value": [1.0]}),
+    ))
+    with pytest.raises(ValueError, match="missing a variant side"):
+        tea_tasting.data.read_paired(
+            data,
+            pair_id="pair_id",
+            variant="variant",
+            missing_side="raise",
+        )
+
+
+def test_read_paired_incomplete_values_truncated(data_paired: pa.Table) -> None:
+    extra = pa.table({
+        "pair_id": list(range(3, 20)),
+        "variant": [0] * 17,
+        "value": [1.0] * 17,
+    })
+    with pytest.raises(ValueError, match=r"\.\.\."):
+        tea_tasting.data.read_paired(
+            pa.concat_tables((data_paired, extra)),
+            pair_id="pair_id",
+            variant="variant",
+            missing_side="raise",
+        )
+
+
+def test_read_paired_raises_for_duplicate_side(data_paired: pa.Table) -> None:
+    data = pa.concat_tables((
+        data_paired,
+        pa.table({"pair_id": [0], "variant": [0], "value": [1.0]}),
+    ))
+    with pytest.raises(ValueError, match="at most one observation per variant"):
+        tea_tasting.data.read_paired(
+            data,
+            pair_id="pair_id",
+            variant="variant",
+        )
+
+
+def test_read_paired_duplicates_truncated() -> None:
+    pair_ids = [pair for pair in range(15) for _ in range(2)]
+    data = pa.table({
+        "pair_id": pair_ids,
+        "variant": [0] * 30,
+        "value": [1.0] * 30,
+    })
+    with pytest.raises(ValueError, match=r"\.\.\."):
+        tea_tasting.data.read_paired(
+            data,
+            pair_id="pair_id",
+            variant="variant",
+        )
+
+
+def test_read_paired_raises_for_null_pair_id(data_paired: pa.Table) -> None:
+    data = data_paired.set_column(
+        0,
+        "pair_id",
+        pa.array([0, 0, 1, 1, 2, None], type=pa.int64()),
+    )
+    with pytest.raises(ValueError, match="pair_id must not contain null"):
+        tea_tasting.data.read_paired(
+            data,
+            pair_id="pair_id",
+            variant="variant",
+        )
+
+
+def test_read_paired_raises_for_null_variant(data_paired: pa.Table) -> None:
+    data = data_paired.set_column(
+        1,
+        "variant",
+        pa.array([0, 1, 0, 1, 0, None], type=pa.int64()),
+    )
+    with pytest.raises(ValueError, match="variant must not contain null"):
+        tea_tasting.data.read_paired(
+            data,
+            pair_id="pair_id",
+            variant="variant",
+        )
+
+
+def test_read_paired_raises_for_same_columns(data_paired: pa.Table) -> None:
+    with pytest.raises(ValueError, match="different columns"):
+        tea_tasting.data.read_paired(
+            data_paired,
+            pair_id="variant",
+            variant="variant",
+        )
+
+
+def test_read_paired_raises_for_invalid_missing_side(
+    data_paired: pa.Table,
+) -> None:
+    with pytest.raises(ValueError, match="missing_side"):
+        tea_tasting.data.read_paired(
+            data_paired,
+            pair_id="pair_id",
+            variant="variant",
+            missing_side="keep",  # ty:ignore[invalid-argument-type]
+        )
+
+
+def test_read_paired_custom_backend(data_paired: pa.Table) -> None:
+    paired = tea_tasting.data.read_paired(
+        FakeTable(data_paired),
+        pair_id="pair_id",
+        variant="variant",
+        cols=("value",),
+    )
+    assert paired[0]["value"].to_pylist() == [10.0, 20.0, 30.0]

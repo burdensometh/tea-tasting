@@ -247,6 +247,15 @@ class _HasCols(abc.ABC):
 
 class MetricBaseGranular(MetricBase[MetricResultT], _HasCols):
     """Base class for metrics, which are analyzed using granular data."""
+
+    paired: bool = False
+    """Whether the metric requires pair-aligned data.
+
+    Paired metrics receive one control table and one treatment table whose
+    rows are aligned by pair identifier. Set this attribute to `True` and
+    implement `analyze_paired` to opt into paired analysis.
+    """
+
     @overload
     def analyze(
         self,
@@ -301,6 +310,35 @@ class MetricBaseGranular(MetricBase[MetricResultT], _HasCols):
         return self.analyze_granular(
             control=dfs[control],
             treatment=dfs[treatment],
+        )
+
+    def analyze_paired(
+        self,
+        control: pa.Table,
+        treatment: pa.Table,
+        pair_id: str,
+        *,
+        rng: int | np.random.Generator | np.random.SeedSequence | None = None,
+    ) -> MetricResultT:
+        """Analyze a metric using pair-aligned granular data.
+
+        Control and treatment rows at the same position belong to the same
+        pair identified by `pair_id`. Implementations must preserve this
+        alignment, for example by resampling pair indices and applying the
+        same indices to both sides.
+
+        Args:
+            control: Control data, including the `pair_id` column.
+            treatment: Treatment data, including the `pair_id` column.
+            pair_id: Pair identifier column name.
+            rng: Pseudorandom number generator or seed override. If `None`,
+                use the metric's own random number generator.
+
+        Returns:
+            Analysis result.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support paired analysis.",
         )
 
     @abc.abstractmethod

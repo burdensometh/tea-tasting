@@ -4,6 +4,7 @@ import concurrent.futures
 from types import MappingProxyType
 from typing import TYPE_CHECKING, NamedTuple, TypedDict
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
@@ -21,7 +22,6 @@ if TYPE_CHECKING:
     from typing import Any, Literal
 
     import narwhals.typing
-    import numpy as np
 
 
 pytest_plugins = ("tests.fixtures",)
@@ -403,6 +403,260 @@ def test_experiment_init_custom() -> None:
     experiment = tea_tasting.experiment.Experiment(metrics, "group")  # ty:ignore[invalid-argument-type]
     assert experiment.metrics == metrics
     assert experiment.variant == "group"
+
+
+def _paired_data() -> pa.Table:
+    return pa.table({
+        "pair_id": [0, 0, 1, 1, 2, 2, 3, 3],
+        "variant": [0, 1, 0, 1, 0, 1, 0, 1],
+        "value": [1.0, 2.0, 2.0, 4.0, 3.0, 6.0, 4.0, 8.0],
+        "other": [1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0],
+    })
+
+
+def test_experiment_init_paired() -> None:
+    metric = tea_tasting.metrics.Bootstrap("value", np.mean)
+    experiment = tea_tasting.experiment.Experiment(
+        metric=metric,
+        pair_id="pair_id",
+    )
+    assert experiment.pair_id == "pair_id"
+    assert experiment.missing_side == "drop"
+    assert experiment.metrics == {"metric": metric}
+
+
+def test_experiment_init_paired_raises_for_unpaired_metric() -> None:
+    with pytest.raises(TypeError, match="does not support paired analysis"):
+        tea_tasting.experiment.Experiment(
+            avg_orders=_MetricAggregated("orders"),
+            pair_id="pair_id",
+        )
+
+
+def test_experiment_init_paired_raises_for_same_columns() -> None:
+    with pytest.raises(ValueError, match="different columns"):
+        tea_tasting.experiment.Experiment(
+            metric=tea_tasting.metrics.Bootstrap("value", np.mean),
+            pair_id="variant",
+        )
+
+
+def test_experiment_init_paired_raises_for_invalid_missing_side() -> None:
+    with pytest.raises(ValueError, match="missing_side"):
+        tea_tasting.experiment.Experiment(
+            metric=tea_tasting.metrics.Bootstrap("value", np.mean),
+            pair_id="pair_id",
+            missing_side="keep",  # ty:ignore[invalid-argument-type]
+        )
+
+
+def test_experiment_analyze_paired() -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        value=tea_tasting.metrics.Bootstrap(
+            "value", np.mean, n_resamples=100, rng=42, method="basic"),
+        pair_id="pair_id",
+    )
+    result = experiment.analyze(_paired_data())
+    assert isinstance(result, tea_tasting.experiment.ExperimentResult)
+    value = result["value"]
+    assert value.control == pytest.approx(2.5)
+    assert value.treatment == pytest.approx(5)
+    assert value.effect_size == pytest.approx(2.5)
+    assert value.effect_size_ci_lower <= value.effect_size <= value.effect_size_ci_upper
+
+
+def test_experiment_analyze_paired_uses_rng_plan() -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        metric=tea_tasting.metrics.Bootstrap(
+            "value", np.mean, n_resamples=100, method="basic"),
+        pair_id="pair_id",
+    )
+    data = _paired_data()
+    result1 = experiment.analyze(data, rng=42)["metric"]
+    result2 = experiment.analyze(data, rng=42)["metric"]
+    result3 = experiment.analyze(data, rng=21)["metric"]
+    assert result1.effect_size_ci_lower == result2.effect_size_ci_lower
+    assert result1.effect_size_ci_upper == result2.effect_size_ci_upper
+    assert (
+        result1.effect_size_ci_lower,
+        result1.effect_size_ci_upper,
+    ) != (
+        result3.effect_size_ci_lower,
+        result3.effect_size_ci_upper,
+    )
+
+
+def test_experiment_analyze_paired_seed_plan_independent_metrics() -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        metric0=tea_tasting.metrics.Bootstrap(
+            "value", np.mean, n_resamples=100, method="basic"),
+        metric1=tea_tasting.metrics.Bootstrap(
+            "value", np.mean, n_resamples=100, method="basic"),
+        pair_id="pair_id",
+    )
+    data = _paired_data()
+    results = experiment.analyze(data, rng=42)
+    assert (
+        results["metric0"].effect_size_ci_lower,
+        results["metric0"].effect_size_ci_upper,
+    ) != (
+        results["metric1"].effect_size_ci_lower,
+        results["metric1"].effect_size_ci_upper,
+    )
+
+
+def test_experiment_analyze_paired_metric_rng_when_no_rng() -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        metric0=tea_tasting.metrics.Bootstrap(
+            "value", np.mean, n_resamples=100, rng=42, method="basic"),
+        metric1=tea_tasting.metrics.Bootstrap(
+            "value", np.mean, n_resamples=100, rng=42, method="basic"),
+        pair_id="pair_id",
+    )
+    result = experiment.analyze(_paired_data())
+    assert result["metric0"] == result["metric1"]
+
+
+def test_experiment_analyze_paired_shared_population() -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        value=tea_tasting.metrics.Bootstrap(
+            "value", np.mean, n_resamples=100, rng=42, method="basic"),
+        other=tea_tasting.metrics.Bootstrap(
+            "other", np.mean, n_resamples=100, rng=42, method="basic"),
+        pair_id="pair_id",
+    )
+    data = _paired_data()
+    result = experiment.analyze(data)
+    assert result["value"].control == pytest.approx(2.5)
+    assert result["other"].control == pytest.approx(2.5)
+    assert result["other"].effect_size == pytest.approx(0)
+
+
+def test_experiment_analyze_paired_raises_for_aggregated_data(
+    data_aggr: dict[Hashable, tea_tasting.aggr.Aggregates],
+) -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        value=tea_tasting.metrics.Bootstrap("value", np.mean),
+        pair_id="pair_id",
+    )
+    with pytest.raises(TypeError, match="Aggregated data"):
+        experiment.analyze(data_aggr)
+
+
+def test_experiment_analyze_paired_missing_side_drop() -> None:
+    data = pa.concat_tables((
+        _paired_data(),
+        pa.table({"pair_id": [4], "variant": [0], "value": [1.0], "other": [1.0]}),
+    ))
+    experiment = tea_tasting.experiment.Experiment(
+        value=tea_tasting.metrics.Bootstrap(
+            "value", np.mean, n_resamples=100, rng=42, method="basic"),
+        pair_id="pair_id",
+    )
+    result = experiment.analyze(data)
+    assert result["value"].control == pytest.approx(2.5)
+
+
+def test_experiment_analyze_paired_missing_side_raise() -> None:
+    data = pa.concat_tables((
+        _paired_data(),
+        pa.table({"pair_id": [4], "variant": [0], "value": [1.0], "other": [1.0]}),
+    ))
+    experiment = tea_tasting.experiment.Experiment(
+        value=tea_tasting.metrics.Bootstrap("value", np.mean),
+        pair_id="pair_id",
+        missing_side="raise",
+    )
+    with pytest.raises(ValueError, match="missing a variant side"):
+        experiment.analyze(data)
+
+
+def test_experiment_analyze_paired_all_variants() -> None:
+    data = _paired_data()
+    data = pa.concat_tables((
+        data,
+        data.filter(pc.equal(data["variant"], pa.scalar(1))).set_column(
+            data.schema.get_field_index("variant"),
+            "variant",
+            pa.array([2] * 4),
+        ),
+    ))
+    experiment = tea_tasting.experiment.Experiment(
+        value=tea_tasting.metrics.Bootstrap(
+            "value", np.mean, n_resamples=100, rng=42, method="basic"),
+        pair_id="pair_id",
+    )
+    results = experiment.analyze(data, control=0, all_variants=True)
+    assert set(results.keys()) == {(0, 1), (0, 2)}
+    assert results[0, 1] == results[0, 2]
+
+
+def test_experiment_analyze_paired_all_variants_raises() -> None:
+    data = _paired_data()
+    data = pa.concat_tables((
+        data,
+        data.filter(pc.equal(data["variant"], pa.scalar(1))).set_column(
+            data.schema.get_field_index("variant"),
+            "variant",
+            pa.array([2] * 4),
+        ),
+    ))
+    experiment = tea_tasting.experiment.Experiment(
+        value=tea_tasting.metrics.Bootstrap("value", np.mean),
+        pair_id="pair_id",
+    )
+    with pytest.raises(ValueError, match="all_variants"):
+        experiment.analyze(data)
+
+
+def test_experiment_analyze_paired_rng_generator() -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        value=tea_tasting.metrics.Bootstrap(
+            "value", np.mean, n_resamples=100, method="basic"),
+        pair_id="pair_id",
+    )
+    data = _paired_data()
+    result1 = experiment.analyze(data, rng=np.random.default_rng(42))
+    result2 = experiment.analyze(data, rng=np.random.default_rng(42))
+    assert result1 == result2
+
+
+def test_experiment_analyze_paired_rng_seed_sequence() -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        value=tea_tasting.metrics.Bootstrap(
+            "value", np.mean, n_resamples=100, method="basic"),
+        pair_id="pair_id",
+    )
+    data = _paired_data()
+    result1 = experiment.analyze(data, rng=np.random.SeedSequence(42))
+    result2 = experiment.analyze(data, rng=np.random.SeedSequence(42))
+    assert result1 == result2
+
+
+def test_experiment_analyze_paired_raises_for_non_granular_metric() -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        value=tea_tasting.metrics.Bootstrap("value", np.mean),
+        pair_id="pair_id",
+    )
+    experiment.metrics["bad"] = _Metric("value")
+    with pytest.raises(TypeError, match="does not support paired analysis"):
+        experiment.analyze(_paired_data())
+    experiment = tea_tasting.experiment.Experiment(
+        value=tea_tasting.metrics.Bootstrap("value", np.mean),
+        pair_id="pair_id",
+    )
+    with pytest.raises(NotImplementedError, match="paired"):
+        experiment.solve_power(_paired_data())
+
+
+def test_experiment_simulate_paired_raises() -> None:
+    experiment = tea_tasting.experiment.Experiment(
+        value=tea_tasting.metrics.Bootstrap("value", np.mean, n_resamples=10),
+        pair_id="pair_id",
+    )
+    with pytest.raises(NotImplementedError, match="paired"):
+        experiment.simulate(_paired_data(), 1)
+
 
 
 def test_experiment_analyze_default(

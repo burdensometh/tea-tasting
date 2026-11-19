@@ -17,6 +17,7 @@ tea-tasting is a Python package for the statistical analysis of A/B tests featur
 - Confidence intervals for both absolute and percentage changes.
 - Checks for sample-ratio mismatches.
 - Power analysis.
+- Matched-pairs experiments with paired bootstrap resampling.
 - Multiple hypothesis testing (family-wise error rate and false discovery rate).
 - Simulated experiments, including A/A tests.
 - Pretty representation of analysis results: rounding to significant digits, rendering in terminals, Jupyter/IPython, and marimo notebooks, serialization to Markdown, and conversion to pandas and Polars DataFrames.

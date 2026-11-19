@@ -50,6 +50,9 @@ class BootstrapResult(NamedTuple):
 
 
 class Bootstrap(MetricBaseGranular[BootstrapResult]):  # noqa: D101
+    paired = True
+    """Whether the metric supports pair-aligned analysis."""
+
     def __init__(  # noqa: PLR0913
         self,
         columns: str | Sequence[str],
@@ -219,6 +222,61 @@ class Bootstrap(MetricBaseGranular[BootstrapResult]):  # noqa: D101
         Returns:
             Analysis result.
         """
+        contr = _select_as_numpy(control, self.columns)
+        treat = _select_as_numpy(treatment, self.columns)
+        contr, treat = _handle_nan_policy(contr, treat, self.nan_policy)
+        return self._bootstrap(
+            contr=contr,
+            treat=treat,
+            paired=False,
+            rng=self.rng,
+        )
+
+
+    def analyze_paired(
+        self,
+        control: pa.Table,
+        treatment: pa.Table,
+        pair_id: str,
+        *,
+        rng: int | np.random.Generator | np.random.SeedSequence | None = None,
+    ) -> BootstrapResult:
+        """Analyze a metric using pair-aligned granular data.
+
+        Control and treatment rows at the same position must belong to the same
+        pair. The bootstrap resamples pair indices and applies the same indices
+        to both sides, so the paired difference is estimated on each resample.
+        Control and treatment are never resampled independently.
+
+        Args:
+            control: Control data, including the `pair_id` column.
+            treatment: Treatment data, including the `pair_id` column.
+            pair_id: Pair identifier column name.
+            rng: Pseudorandom number generator or seed override.
+
+        Returns:
+            Analysis result.
+        """
+        _check_pair_alignment(control, treatment, pair_id)
+        contr = _select_as_numpy(control, self.columns)
+        treat = _select_as_numpy(treatment, self.columns)
+        contr, treat = _handle_paired_nan_policy(contr, treat, self.nan_policy)
+        return self._bootstrap(
+            contr=contr,
+            treat=treat,
+            paired=True,
+            rng=self.rng if rng is None else rng,
+        )
+
+
+    def _bootstrap(
+        self,
+        contr: npt.NDArray[np.number],
+        treat: npt.NDArray[np.number],
+        *,
+        paired: bool,
+        rng: int | np.random.Generator | np.random.SeedSequence | None,
+    ) -> BootstrapResult:
         def statistic(
             contr: npt.NDArray[np.number],
             treat: npt.NDArray[np.number],
@@ -233,9 +291,6 @@ class Bootstrap(MetricBaseGranular[BootstrapResult]):  # noqa: D101
 
             return np.stack((effect_size, rel_effect_size), axis=0)
 
-        contr = _select_as_numpy(control, self.columns)
-        treat = _select_as_numpy(treatment, self.columns)
-        contr, treat = _handle_nan_policy(contr, treat, self.nan_policy)
         if len(contr) <= 0 or len(treat) <= 0:
             return BootstrapResult(
                 control=float("nan"),
@@ -254,11 +309,12 @@ class Bootstrap(MetricBaseGranular[BootstrapResult]):  # noqa: D101
             statistic,
             n_resamples=self.n_resamples,
             batch=self.batch,
+            paired=paired,
             axis=0,
             confidence_level=self.confidence_level,
             alternative=self.alternative,
             method=self.method,
-            rng=self.rng,
+            rng=rng,
         )
         ci = result.confidence_interval
 
@@ -272,6 +328,44 @@ class Bootstrap(MetricBaseGranular[BootstrapResult]):  # noqa: D101
             rel_effect_size_ci_lower=float(ci.low[1]),
             rel_effect_size_ci_upper=float(ci.high[1]),
         )
+
+
+def _check_pair_alignment(
+    control: pa.Table,
+    treatment: pa.Table,
+    pair_id: str,
+) -> None:
+    if pair_id not in control.column_names or pair_id not in treatment.column_names:
+        raise ValueError(f"Paired data must include the {pair_id!r} column.")
+    if control.num_rows != treatment.num_rows:
+        raise ValueError(
+            "Control and treatment paired data must have the same number of rows.",
+        )
+    if not control[pair_id].equals(treatment[pair_id]):
+        raise ValueError(
+            "Control and treatment pair identifiers are not aligned. "
+            "Use tea_tasting.data.read_paired to prepare paired data.",
+        )
+
+
+def _handle_paired_nan_policy(
+    control: npt.NDArray[np.number],
+    treatment: npt.NDArray[np.number],
+    nan_policy: Literal["propagate", "omit", "raise"],
+) -> tuple[npt.NDArray[np.number], npt.NDArray[np.number]]:
+    if nan_policy == "omit":
+        if control.ndim == 1:
+            valid = ~np.isnan(control) & ~np.isnan(treatment)
+        else:
+            valid = ~(np.isnan(control).any(axis=1) | np.isnan(treatment).any(axis=1))
+        return control[valid], treatment[valid]
+
+    if nan_policy == "raise" and (
+        np.isnan(control).any() or np.isnan(treatment).any()
+    ):
+        raise ValueError("Input contains nan.")
+
+    return control, treatment
 
 
 def _select_as_numpy(

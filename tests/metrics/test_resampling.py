@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pyarrow as pa
 import pytest
+import scipy.stats
 
 import tea_tasting.config
 import tea_tasting.data
@@ -295,3 +296,247 @@ def test_quantile_analyze_nan_policy_omit() -> None:
     assert result.treatment == 3
     assert result.effect_size == 1
     assert result.rel_effect_size == 0.5
+
+
+@pytest.fixture
+def data_paired() -> tuple[pa.Table, pa.Table]:
+    control = pa.table({"pair_id": [0, 1, 2, 3, 4], "value": [1.0, 2.0, 3.0, 4.0, 5.0]})
+    treatment = pa.table(
+        {"pair_id": [0, 1, 2, 3, 4], "value": [2.0, 4.0, 6.0, 8.0, 10.0]},
+    )
+    return control, treatment
+
+
+def test_bootstrap_paired(data_paired: tuple[pa.Table, pa.Table]) -> None:
+    metric = tea_tasting.metrics.resampling.Bootstrap(
+        "value",
+        np.mean,
+        n_resamples=100,
+        rng=42,
+        method="basic",
+    )
+    control, treatment = data_paired
+    result = metric.analyze_paired(control, treatment, "pair_id")
+    assert isinstance(result, tea_tasting.metrics.resampling.BootstrapResult)
+    assert result.control == pytest.approx(3)
+    assert result.treatment == pytest.approx(6)
+    assert result.effect_size == pytest.approx(3)
+    assert result.rel_effect_size == pytest.approx(1)
+
+    # Reference: bootstrapping the paired differences with shared indices
+    # must produce the same distribution as the paired bootstrap.
+    diffs = treatment["value"].to_numpy() - control["value"].to_numpy()
+    reference = scipy.stats.bootstrap(
+        (diffs,),
+        lambda sample, axis: np.stack((
+            np.mean(sample, axis=axis),
+            np.divide(np.mean(sample, axis=axis), np.mean(diffs)),
+        )),
+        n_resamples=100,
+        axis=0,
+        method="basic",
+        rng=42,
+    )
+    assert result.effect_size_ci_lower == pytest.approx(
+        reference.confidence_interval.low[0],
+    )
+    assert result.effect_size_ci_upper == pytest.approx(
+        reference.confidence_interval.high[0],
+    )
+
+
+def test_bootstrap_paired_rng_override(
+    data_paired: tuple[pa.Table, pa.Table],
+) -> None:
+    metric = tea_tasting.metrics.resampling.Bootstrap(
+        "value",
+        np.mean,
+        n_resamples=100,
+        rng=1,
+        method="basic",
+    )
+    control, treatment = data_paired
+    result1 = metric.analyze_paired(control, treatment, "pair_id", rng=42)
+    result2 = metric.analyze_paired(control, treatment, "pair_id", rng=42)
+    result3 = metric.analyze_paired(control, treatment, "pair_id")
+    assert result1 == result2
+    assert result1 != result3
+
+
+def test_bootstrap_paired_multiple_columns() -> None:
+    def ratio_of_means(
+        sample: npt.NDArray[np.number],
+        axis: int,
+    ) -> npt.NDArray[np.number]:
+        stat = np.mean(sample, axis=axis)
+        return stat[0] / stat[1]
+
+    metric = tea_tasting.metrics.resampling.Bootstrap(
+        ("numer", "denom"),
+        ratio_of_means,
+        n_resamples=100,
+        rng=42,
+        method="basic",
+    )
+    control = pa.table({
+        "pair_id": [0, 1, 2, 3],
+        "numer": [1.0, 2.0, 3.0, 4.0],
+        "denom": [2.0, 2.0, 2.0, 2.0],
+    })
+    treatment = pa.table({
+        "pair_id": [0, 1, 2, 3],
+        "numer": [3.0, 4.0, 5.0, 6.0],
+        "denom": [4.0, 4.0, 4.0, 4.0],
+    })
+    result = metric.analyze_paired(control, treatment, "pair_id")
+    assert result.control == pytest.approx(1.25)
+    assert result.treatment == pytest.approx(1.125)
+    assert result.effect_size == pytest.approx(-0.125)
+
+
+def test_bootstrap_paired_nan_policy_omit() -> None:
+    metric = tea_tasting.metrics.resampling.Bootstrap(
+        "value",
+        np.mean,
+        n_resamples=10,
+        method="basic",
+        nan_policy="omit",
+        rng=42,
+    )
+    control = pa.table({"pair_id": [0, 1, 2], "value": [1.0, float("nan"), 5.0]})
+    treatment = pa.table({"pair_id": [0, 1, 2], "value": [2.0, 2.0, 2.0]})
+    result = metric.analyze_paired(control, treatment, "pair_id")
+    assert result.control == pytest.approx(3)
+    assert result.treatment == pytest.approx(2)
+    assert result.effect_size == pytest.approx(-1)
+
+
+def test_bootstrap_paired_nan_policy_omit_multiple_columns() -> None:
+    def ratio_of_means(
+        sample: npt.NDArray[np.number],
+        axis: int,
+    ) -> npt.NDArray[np.number]:
+        stat = np.mean(sample, axis=axis)
+        return stat[0] / stat[1]
+
+    metric = tea_tasting.metrics.resampling.Bootstrap(
+        ("a", "b"),
+        ratio_of_means,
+        n_resamples=10,
+        method="basic",
+        nan_policy="omit",
+        rng=42,
+    )
+    control = pa.table({
+        "pair_id": [0, 1, 2, 3],
+        "a": [2.0, float("nan"), 6.0, 9.0],
+        "b": [1.0, 2.0, 2.0, 3.0],
+    })
+    treatment = pa.table({
+        "pair_id": [0, 1, 2, 3],
+        "a": [6.0, 9.0, float("nan"), 12.0],
+        "b": [2.0, 3.0, 3.0, 4.0],
+    })
+    result = metric.analyze_paired(control, treatment, "pair_id")
+    assert result.control == pytest.approx(2.75)
+    assert result.treatment == pytest.approx(3)
+
+
+def test_bootstrap_paired_nan_policy_raise() -> None:
+    metric = tea_tasting.metrics.resampling.Bootstrap(
+        "value",
+        np.mean,
+        nan_policy="raise",
+    )
+    control = pa.table({"pair_id": [0, 1], "value": [1.0, float("nan")]})
+    treatment = pa.table({"pair_id": [0, 1], "value": [2.0, 3.0]})
+    with pytest.raises(ValueError, match=r"Input contains nan\."):
+        metric.analyze_paired(control, treatment, "pair_id")
+
+
+def test_bootstrap_paired_nan_policy_propagate() -> None:
+    metric = tea_tasting.metrics.resampling.Bootstrap(
+        "value",
+        np.mean,
+        n_resamples=10,
+        method="basic",
+        nan_policy="propagate",
+        rng=42,
+    )
+    control = pa.table({"pair_id": [0, 1], "value": [1.0, float("nan")]})
+    treatment = pa.table({"pair_id": [0, 1], "value": [2.0, 3.0]})
+    result = metric.analyze_paired(control, treatment, "pair_id")
+    assert np.isnan(result.control)
+    assert np.isnan(result.effect_size)
+
+
+def test_bootstrap_paired_empty() -> None:
+    metric = tea_tasting.metrics.resampling.Bootstrap("value", np.mean)
+    empty = pa.table({"pair_id": pa.array([], type=pa.int64()), "value": pa.array([])})
+    result = metric.analyze_paired(empty, empty, "pair_id")
+    assert np.isnan(result.control)
+    assert np.isnan(result.treatment)
+    assert np.isnan(result.effect_size)
+    assert np.isnan(result.rel_effect_size)
+
+
+def test_bootstrap_paired_raises_for_missing_pair_id(
+    data_paired: tuple[pa.Table, pa.Table],
+) -> None:
+    metric = tea_tasting.metrics.resampling.Bootstrap("value", np.mean)
+    control, treatment = data_paired
+    with pytest.raises(ValueError, match="must include the 'pair_id' column"):
+        metric.analyze_paired(
+            control.drop_columns("pair_id"),
+            treatment,
+            "pair_id",
+        )
+
+
+def test_bootstrap_paired_raises_for_length_mismatch(
+    data_paired: tuple[pa.Table, pa.Table],
+) -> None:
+    metric = tea_tasting.metrics.resampling.Bootstrap("value", np.mean)
+    control, treatment = data_paired
+    with pytest.raises(ValueError, match="same number of rows"):
+        metric.analyze_paired(control, treatment.slice(0, 2), "pair_id")
+
+
+def test_bootstrap_paired_raises_for_misaligned(
+    data_paired: tuple[pa.Table, pa.Table],
+) -> None:
+    metric = tea_tasting.metrics.resampling.Bootstrap("value", np.mean)
+    control, treatment = data_paired
+    misaligned = treatment.set_column(
+        0,
+        "pair_id",
+        pa.array([1, 0, 2, 3, 4], type=pa.int64()),
+    )
+    with pytest.raises(ValueError, match="not aligned"):
+        metric.analyze_paired(control, misaligned, "pair_id")
+
+
+def test_bootstrap_not_paired_by_default(
+    data_gran: dict[Hashable, pa.Table],
+) -> None:
+    metric = tea_tasting.metrics.resampling.Bootstrap("revenue", np.mean)
+    assert metric.paired is True
+    result = metric.analyze_granular(data_gran[0], data_gran[1])
+    assert isinstance(result, tea_tasting.metrics.resampling.BootstrapResult)
+
+
+def test_quantile_paired() -> None:
+    metric = tea_tasting.metrics.resampling.Quantile(
+        "value",
+        q=0.5,
+        n_resamples=100,
+        method="basic",
+        rng=42,
+    )
+    control = pa.table({"pair_id": [0, 1, 2, 3], "value": [1.0, 2.0, 3.0, 4.0]})
+    treatment = pa.table({"pair_id": [0, 1, 2, 3], "value": [2.0, 3.0, 4.0, 5.0]})
+    result = metric.analyze_paired(control, treatment, "pair_id")
+    assert result.control == pytest.approx(2.5)
+    assert result.treatment == pytest.approx(3.5)
+    assert result.effect_size == pytest.approx(1)
+

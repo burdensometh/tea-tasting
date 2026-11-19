@@ -267,6 +267,19 @@ def test_metric_base_granular_mapping(
     assert kwargs["treatment"].equals(correct_gran[1])
 
 
+def test_metric_base_granular_analyze_paired_not_implemented(
+    gran_metric: tea_tasting.metrics.base.MetricBaseGranular[dict[str, object]],
+    data_arrow: pa.Table,
+) -> None:
+    assert gran_metric.paired is False
+    with pytest.raises(NotImplementedError, match="does not support paired analysis"):
+        gran_metric.analyze_paired(
+            control=data_arrow,
+            treatment=data_arrow,
+            pair_id="user",
+        )
+
+
 def test_metric_base_granular_requires_variant(
     gran_metric: tea_tasting.metrics.base.MetricBaseGranular[dict[str, object]],
     data_arrow: pa.Table,

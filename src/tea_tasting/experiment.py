@@ -189,6 +189,9 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
         self,
         metrics: dict[str, tea_tasting.metrics.MetricBase[Any]] | None = None,
         variant: str = "variant",
+        pair_id: str | None = None,
+        *,
+        missing_side: Literal["drop", "raise"] = "drop",
         **kw_metrics: tea_tasting.metrics.MetricBase[Any],
     ) -> None:
         """Experiment definition: metrics and variant column.
@@ -196,6 +199,15 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
         Args:
             metrics: Dictionary of metrics with metric names as keys.
             variant: Variant column name.
+            pair_id: Pair identifier column name for matched-pairs experiments.
+                If `None`, units are assumed to be independent. If set, each
+                matching pair must contribute exactly one control and one
+                treatment observation, and metrics must support paired analysis.
+            missing_side: Rule for pairs missing a variant side:
+
+                - `"drop"`: exclude incomplete pairs from the analysis.
+                - `"raise"`: raise an exception if any pair is incomplete.
+
             kw_metrics: Metrics with metric names as parameter names.
 
         Examples:
@@ -236,6 +248,29 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
             orders per session   0.266     0.289            8.8%      [-0.89%, 19%] 0.0762
             orders per user      0.530     0.573            8.0%       [-2.0%, 19%]  0.118
             revenue per user      5.24      5.73            9.3%       [-2.4%, 22%]  0.123
+
+            ```
+
+            Matched pairs:
+
+            ```pycon
+            >>> import numpy as np
+            >>> import pyarrow as pa
+
+            >>> data = pa.table({
+            ...     "pair_id": [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5],
+            ...     "variant": [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1],
+            ...     "revenue": [10.0, 12.0, 20.0, 19.0, 30.0, 33.0, 40.0, 44.0,
+            ...                 50.0, 49.0, 60.0, 66.0],
+            ... })
+            >>> experiment = tt.Experiment(
+            ...     revenue_per_pair=tt.Bootstrap(
+            ...         "revenue", np.mean, n_resamples=1000, rng=42),
+            ...     pair_id="pair_id",
+            ... )
+            >>> experiment.analyze(data)
+            metric           control treatment rel_effect_size rel_effect_size_ci pvalue
+            revenue_per_pair    35.0      37.2            6.2%       [-1.1%, 10%]      -
 
             ```
 
@@ -289,6 +324,28 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
         self.metrics = metrics
         self.variant = tea_tasting.utils.check_scalar(
             variant, "variant", typ=str)
+        self.pair_id = tea_tasting.utils.check_scalar(
+            pair_id, "pair_id", typ=str | None)
+        self.missing_side: Literal["drop", "raise"] = tea_tasting.utils.check_scalar(
+            missing_side, "missing_side", typ=str, in_={"drop", "raise"})
+        if self.pair_id is not None and self.pair_id == self.variant:
+            raise ValueError("pair_id and variant must be different columns.")
+        if self.pair_id is not None:
+            self._validate_paired_metrics()
+
+
+    def _validate_paired_metrics(self) -> None:
+        for name, metric in self.metrics.items():
+            if not (
+                isinstance(metric, tea_tasting.metrics.MetricBaseGranular)
+                and getattr(metric, "paired", False)
+            ):
+                raise TypeError(
+                    f"Metric {name!r} does not support paired analysis. "
+                    "A paired experiment requires metrics that preserve the "
+                    "pair structure, such as tea_tasting.Bootstrap or "
+                    "tea_tasting.Quantile.",
+                )
 
 
     @overload
@@ -298,6 +355,7 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
         control: Hashable | None = None,
         *,
         all_variants: Literal[False] = False,
+        rng: int | np.random.Generator | np.random.SeedSequence | None = None,
     ) -> ExperimentResult:
         ...
 
@@ -308,6 +366,7 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
         control: Hashable | None = None,
         *,
         all_variants: Literal[True],
+        rng: int | np.random.Generator | np.random.SeedSequence | None = None,
     ) -> ExperimentResults:
         ...
 
@@ -317,20 +376,35 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
         control: Hashable | None = None,
         *,
         all_variants: bool = False,
+        rng: int | np.random.Generator | np.random.SeedSequence | None = None,
     ) -> ExperimentResult | ExperimentResults:
         """Analyze the experiment.
 
         Args:
             data: Experimental data or aggregated data by variants.
+                Aggregated data is not allowed in a paired experiment because
+                aggregate statistics cannot represent the pair structure.
             control: Control variant. If `None`, the variant with the minimal ID
                 is used as a control.
             all_variants: If `True`, analyze all pairs of variants. Otherwise,
                 analyze only one pair of variants.
+            rng: Base pseudorandom number generator or seed used to derive an
+                independent, deterministic random stream for each metric and
+                variant pair in a paired experiment. If `None`, each metric uses
+                its own `rng` parameter. Ignored for unpaired analysis.
 
         Returns:
             Experiment result.
         """
         tea_tasting.utils.check_scalar(all_variants, "all_variants", typ=bool)
+        if self.pair_id is not None:
+            return self._analyze_paired(
+                data=data,
+                control=control,
+                all_variants=all_variants,
+                rng=rng,
+            )
+
         aggregated_data, granular_data = self._read_data(data)
         variants = self._read_variants(data, aggregated_data, granular_data)
         variant_pairs = self._get_variant_pairs(variants, control)
@@ -358,6 +432,100 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
             results |= {(contr, treat): result}
 
         return results
+
+
+    def _analyze_paired(
+        self,
+        data: tea_tasting.data.Table | tea_tasting.data.AggregatesByVariant,
+        control: Hashable | None,
+        *,
+        all_variants: bool,
+        rng: int | np.random.Generator | np.random.SeedSequence | None,
+    ) -> ExperimentResult | ExperimentResults:
+        if tea_tasting.data._is_aggregates_mapping(data):
+            raise TypeError(
+                "Aggregated data cannot be analyzed in a paired experiment: "
+                "aggregate statistics do not contain the pair structure. "
+                "Provide granular data with the pair identifier column.",
+            )
+
+        paired_data = self._read_paired_data(data)
+        variants = sorted(paired_data)  # ty:ignore[invalid-argument-type]
+        variant_pairs = self._get_variant_pairs(variants, control)
+
+        if len(variant_pairs) != 1 and not all_variants:
+            raise ValueError(
+                "all_variants is False, but there are more than one pair of variants.")
+
+        seed_plan = self._paired_seed_plan(rng, variant_pairs)
+        results = ExperimentResults()
+        for contr, treat in variant_pairs:
+            result = ExperimentResult()
+            for name, metric in self.metrics.items():
+                result |= {name: _analyze_paired(
+                    metric=metric,
+                    control=paired_data[contr],
+                    treatment=paired_data[treat],
+                    pair_id=self.pair_id,  # ty:ignore[invalid-argument-type]
+                    rng=seed_plan[name, contr, treat],
+                )}
+
+            if not all_variants:
+                return result
+
+            results |= {(contr, treat): result}
+
+        return results
+
+
+    def _read_paired_data(
+        self,
+        data: tea_tasting.data.Table | tea_tasting.data.AggregatesByVariant,
+    ) -> dict[Hashable, pa.Table]:
+        cols = tuple(dict.fromkeys(
+            col
+            for metric in self.metrics.values()
+            for col in getattr(metric, "cols", ())
+        ))
+        return tea_tasting.data.read_paired(
+            data,  # ty:ignore[invalid-argument-type]
+            pair_id=self.pair_id,  # ty:ignore[invalid-argument-type]
+            variant=self.variant,
+            cols=cols,
+            missing_side=self.missing_side,
+        )
+
+
+    def _paired_seed_plan(
+        self,
+        rng: int | np.random.Generator | np.random.SeedSequence | None,
+        variant_pairs: tuple[tuple[Hashable, Hashable], ...],
+    ) -> dict[tuple[str, Hashable, Hashable], object]:
+        if rng is None:
+            return {
+                (name, contr, treat): None
+                for name in self.metrics
+                for contr, treat in variant_pairs
+            }
+
+        rng = tea_tasting.utils.auto_check(rng, "rng")
+        n_children = len(self.metrics) * len(variant_pairs)
+        if isinstance(rng, np.random.Generator):
+            children: list[object] = list(rng.spawn(n_children))
+        else:
+            seed_seq = (
+                rng if isinstance(rng, np.random.SeedSequence)
+                else np.random.SeedSequence(rng)
+            )
+            children = list(seed_seq.spawn(n_children))
+
+        return {
+            (name, contr, treat): children[
+                metric_index * len(variant_pairs) + pair_index
+            ]
+            for metric_index, name in enumerate(self.metrics)
+            for pair_index, (contr, treat) in enumerate(variant_pairs)
+        }
 
 
     def _read_data(
@@ -478,6 +646,12 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
             "parameter",
             in_={"power", "effect_size", "rel_effect_size", "n_obs"},
         )
+        if self.pair_id is not None:
+            raise NotImplementedError(
+                "Power analysis is not supported for paired experiments: "
+                "the paired variance depends on the within-pair correlation, "
+                "which is not available from aggregate statistics.",
+            )
         aggr_cols = tea_tasting.aggr.AggrCols()
         for metric in self.metrics.values():
             if isinstance(metric, tea_tasting.metrics.PowerBaseAggregated):
@@ -533,6 +707,12 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
         tea_tasting.utils.auto_check(ratio, "ratio")
         rng = tea_tasting.utils.auto_check(rng, "rng")
 
+        if self.pair_id is not None:
+            raise NotImplementedError(
+                "Simulation is not supported for paired experiments: "
+                "randomly assigning variants would break the pair structure.",
+            )
+
         if not callable(data):
             gran_cols: set[str] = set()
             for metric in self.metrics.values():
@@ -572,6 +752,29 @@ class Experiment(tea_tasting.utils.ReprMixin):  # noqa: D101
                     progress_bar.update(len(batch_result))
             return results
         return SimulationResults(itertools.chain.from_iterable(batch_results))
+
+
+def _analyze_paired(
+    metric: tea_tasting.metrics.MetricBase[Any],
+    control: pa.Table,
+    treatment: pa.Table,
+    pair_id: str,
+    *,
+    rng: object,
+) -> tea_tasting.metrics.MetricResult:
+    if not isinstance(metric, tea_tasting.metrics.MetricBaseGranular):
+        raise TypeError(
+            f"Metric {metric!r} does not support paired analysis. "
+            "A paired experiment requires metrics that preserve the "
+            "pair structure, such as tea_tasting.Bootstrap or "
+            "tea_tasting.Quantile.",
+        )
+    return metric.analyze_paired(
+        control=control,
+        treatment=treatment,
+        pair_id=pair_id,
+        rng=rng,  # ty:ignore[invalid-argument-type]
+    )
 
 
 def _simulate_batch(
